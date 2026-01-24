@@ -1,1 +1,0 @@
-### GPU accelerated BLAST algorithm
