@@ -9,5 +9,5 @@
 uint8_t encode_char(char c);
 char decode_bits(uint8_t b);
 
-std::vector<uint8_t> encoder(const char* input, size_t length);
-std::vector<char> decoder(const std::vector<uint8_t>& input, size_t length);
+void encoder(const char* input, size_t length, uint8_t* output);
+void decoder(const uint8_t* input, size_t length, char* output);
