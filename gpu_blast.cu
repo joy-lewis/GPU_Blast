@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <utility>
 #include <iostream>
+#include "gpu_blast.h"
+#include <cassert>
 
 #define CHUNK_SIZE 2
 #define N 2              // Grid size X
@@ -63,28 +65,27 @@ std::vector<uint8_t> encoder(const char* input, size_t length) { //length=number
 }
 
 // Converting but string to DNA sequence
-std::vector<uint8_t> decoder(const uint8_t* input, size_t length) { //length==original length of the character based DNA sequence
+std::vector<uint8_t> decoder(const uint8_t* input, size_t length) { //length==number of characters that are encoded in the input bits (relevant because last byte might encode less then 4 characters)
     size_t out_size = length; // 4 characters fit in each byte
     std::vector<char> output(out_size); // vector which will hold the resulting decoding
 
     int in_index = 0;
     int out_index = 0;
 
-    //todo: implement the rest of the decoding logic below
-
-    while (in_index < length) { // as long as there are characters left we keep on encoding
-        uint8_t new_byte = 0;
+    while (out_index < length) { // as long as there are characters left we keep on decoding
+        uint8_t byte = input[in_index];
 
         // Encode the next 4 characters
-        for (int i = 0; i < 4; i++) {
-            new_byte <<= 2;
-            if (in_index < length) {
-                uint8_t encoding = decode_bits[input[in_index]];
-                new_byte |= encoding; // insert the two new bits into the existing byte
-                in_index++;
+        for (int shift = 6; shift >= 0; shift -=2) {
+            // we right shift by 6, 4, 2 and then 0 to have each bit pair at the rightmost edge of the byte
+            byte >>= shift;
+            byte &= 0b11; // to isolate the two rightmost bits we care about
+            if (out_index < length) {
+                uint8_t decoding = decode_bits[byte];
+                output[out_index++] = decoding;
             }
         }
-        output[out_index++] = new_byte;
+        in_index++;
     }
 }
 
@@ -92,6 +93,7 @@ std::vector<uint8_t> decoder(const uint8_t* input, size_t length) { //length==or
 int main() {
     !!VERY IMPORTANT: use the length of the original sequence, to know when to stop processing the
     encoded binary sequence, becasue the last few bits are all zero padded.
-    Same goes for when we decode the final alignment back on CPU after GPU sent it over
+    Same goes for when we decode the final alignment. We need to pass along the length of valid bit pairs (i.e. characters)
+    so we dont decode all bits in the last byte of the uint8_t array.
 
 }
