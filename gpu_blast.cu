@@ -127,7 +127,7 @@ int main() {
 
     }
 
-    //todo: free memory
+    //todo: free memory of que
 
 
     return 0;
