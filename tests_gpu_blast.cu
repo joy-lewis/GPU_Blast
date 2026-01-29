@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include "gpu_blast.h"
 
+
 int main() {
     const char* dna = "ACGTACGT";
     size_t dna_length = strlen(dna);

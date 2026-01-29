@@ -2,12 +2,11 @@
 #include <cstdint>
 #include <utility>
 #include <iostream>
-#include "gpu_blast.h"
 #include <cassert>
-
-#define CHUNK_SIZE 2
-#define N 2              // Grid size X
-#define M 2             // Grid size Y
+#include <cstring>
+#include <bitset>
+#include "gpu_blast.h"
+#include <cuda_runtime.h>
 
 #define CHECK_CUDA(call)                                        \
     if ((call) != cudaSuccess)                                  \
@@ -19,12 +18,13 @@
 
 //TODO:VERY IMPORTANT!!
 //use the length of the original sequence, to know when to stop processing the
-//encoded binary sequence, becasue the last few bits are all zero padded.
+//encoded binary sequence, because the last few bits are all zero padded.
 //Same goes for when we decode the final alignment. We need to pass along the length of valid bit pairs (i.e. characters)
 //so we dont decode all bits in the last byte of the uint8_t array.
 
 
-// Data Compression
+///////////// Data Compression
+//////////////////////////////
 uint8_t encode_char(char c) {
     // Compressing the ASCII characters (4 unique DNA bases) to a 2-bit encoding
     switch (c) {
@@ -92,4 +92,43 @@ void decoder(const uint8_t* input, size_t length, char* output) { //length==numb
         }
         in_index++;
     }
+}
+
+/////////// Data Transfer
+/////////////////////////
+
+void transfer_to_device() {
+    // Moving a full sequence from host to device global memory
+}
+
+
+////////// Kernels
+/////////////////////////
+void launch_kernels() {
+    // Launching the kernels, i.e. blocks on the GPU device
+}
+
+
+/////////// Define Hyperparameters
+//////////////////////////////////
+#define DB_SIZE 10
+
+
+int main() {
+    const char* query = "";
+    //todo: move query and query hash table from host to device global memory
+
+
+    // Process DB sequences one by one
+    for (int si=0; si<DB_SIZE; si++) {
+        //todo: send full DB sequence si over from Host to Device global memory
+
+        //todo: free memory of si
+
+    }
+
+    //todo: free memory
+
+
+    return 0;
 }
