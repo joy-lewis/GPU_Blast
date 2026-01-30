@@ -8,6 +8,14 @@
 #include "gpu_blast.h"
 #include <cuda_runtime.h>
 
+
+/////////// Define Hyperparameters
+//////////////////////////////////
+#define DB_SIZE 10 // number of sequences in Database
+#define K=8 // defines k-mer length
+
+/////////// Sanity checks
+/////////////////////////
 #define CHECK_CUDA(call)                                        \
     if ((call) != cudaSuccess)                                  \
     {                                                           \
@@ -93,10 +101,13 @@ void decoder(const uint8_t* input, size_t length, char* output) { //length==numb
         in_index++;
     }
 }
+void build_lookup_table() {
+    // Keys: all unique k-mers; Values
+    int num_entries = 4K;
+}
 
 /////////// Data Transfer
 /////////////////////////
-
 void transfer_to_device() {
     // Moving a full sequence from host to device global memory
 }
@@ -109,10 +120,6 @@ void launch_kernels() {
 }
 
 
-/////////// Define Hyperparameters
-//////////////////////////////////
-#define DB_SIZE 10
-
 
 int main() {
     const char* query = "";
@@ -123,11 +130,10 @@ int main() {
     for (int si=0; si<DB_SIZE; si++) {
         //todo: send full DB sequence si over from Host to Device global memory
 
-        //todo: free memory of si
+        //todo: free memory of sequence si on device
 
     }
-
-    //todo: free memory of que
+    //todo: free memory of query and and lookup table on device
 
 
     return 0;
