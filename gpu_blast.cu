@@ -94,20 +94,20 @@ char decode_bits(uint8_t b) {
 
 // Converting DNA sequence to bit array
 // Layout for 8-bit array: base 0 is in bits 7–6 of byte 0, base 1 in bits 5–4, base 2 in bits 3–2, base 3 in bits 1–0
-void encoder(const char* input, size_t length, uint8_t* output) { //length=number of characters
-    int in_index = 0;
-    int out_index = 0;
+void encoder(const std::vector<char>& input, size_t length, uint8_t* output) {
+    size_t in_index = 0;
+    size_t out_index = 0;
 
-    while (in_index < length) { // as long as there are characters left we keep on encoding
+    while (in_index < length) {
         uint8_t new_byte = 0;
 
-        // Encode the next 4 characters in a MSB-first manner
+        // pack 4 bases into 1 byte, MSB-first
         for (int i = 0; i < 4; i++) {
-            new_byte <<= 2; // shift the existing encoding two positions to the left to make space for the next bit pair
+            new_byte <<= 2;
             if (in_index < length) {
                 uint8_t encoding = encode_char(input[in_index]);
-                new_byte |= encoding; // insert the two new bits into the left side of the existing byte
-                in_index++;
+                new_byte |= encoding;
+                ++in_index;
             }
         }
         output[out_index++] = new_byte;
@@ -241,17 +241,30 @@ void launch_kernels() {
 }
 
 
-int main() {
-    std::vector<char> query_seq = read_fasta();
+int blast_main() {
+    // Load DNA sequences from database
+    char query_name[32];
+    char db_name[32];
 
+    snprintf(query_name, sizeof(query_name), "ncbi_data/query.fasta");
+    std::vector<char> query_seq = read_fasta(query_name);
+    const int query_nChars = query_seq.size();
+
+    // Encode query sequence to 2-bit encoding
     //todo: 1) encode query_seq
+    const int query_nBytes = (query_nChars + 3) / 4; // 4 bases per byte
+    uint8_t* encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
+    encoder(query_seq, query_nChars, encoder_out);
+
     //todo: 2) create hash table for query_seq
     //todo: 3) allocate device memory for query_seq, and hash_table
     //todo: 4) build struct that holds pointer to query_seq (on device); pointer to hash_table (on device); nBytes interger and nChars (nChars == n DNA bases) integer
 
     // Process DB sequences one by one
     for (int si=0; si<DB_SIZE; si++) {
-        std::vector<char> db_seq = read_fasta();
+        snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.txt", si);
+
+        std::vector<char> db_seq = read_fasta(db_name);
 
         //todo: 5) encode db_seq
         //todo: 6) allocate device memory for db_seq

@@ -27,22 +27,25 @@ static void print_kmer_from_encoded(const uint8_t* encoded_dna, uint32_t pos, ui
     }
 }
 
-int main() {
-    const char* dna = "ACGTACGT";
-    const size_t dna_length = std::strlen(dna);
+int test_main() {
+    std::vector<char> dna = {'A', 'C', 'G', 'T', 'A', 'C', 'G', 'T'};
+    const int dna_length = dna.size();
 
     const size_t encoder_out_size = (dna_length + 3) / 4; // 4 bases per byte
     uint8_t* encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * encoder_out_size);
 
     // Encode using your existing function
     encoder(dna, dna_length, encoder_out);
+    std::cout << "Bytes used: " << encoder_out_size << "\n";
 
     // Decode using your existing function (your decoder expects a char length)
     const int decoder_out_length = (int)dna_length;
     char* decoder_out = (char*) std::malloc(sizeof(char) * decoder_out_length);
     decoder(encoder_out, decoder_out_length, decoder_out);
 
-    std::cout << "Original: " << dna << "\n";
+    std::cout << "Original: ";
+    std::cout.write(dna.data(), dna.size());
+    std::cout << std::endl; // Optional newline
 
     std::cout << "Encoded (bits): ";
     for (size_t i = 0; i < encoder_out_size; i++) {
