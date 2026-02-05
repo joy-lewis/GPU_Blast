@@ -251,7 +251,6 @@ int blast_main() {
     const int query_nChars = query_seq.size();
 
     // Encode query sequence to 2-bit encoding
-    //todo: 1) encode query_seq
     const int query_nBytes = (query_nChars + 3) / 4; // 4 bases per byte
     uint8_t* encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
     encoder(query_seq, query_nChars, encoder_out);
@@ -261,8 +260,8 @@ int blast_main() {
     //todo: 4) build struct that holds pointer to query_seq (on device); pointer to hash_table (on device); nBytes interger and nChars (nChars == n DNA bases) integer
 
     // Process DB sequences one by one
-    for (int si=0; si<DB_SIZE; si++) {
-        snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.txt", si);
+    for (int si=1; si<=DB_SIZE; si++) {
+        snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.fasta", si);
 
         std::vector<char> db_seq = read_fasta(db_name);
 

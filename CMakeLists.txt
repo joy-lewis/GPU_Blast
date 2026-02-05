@@ -35,5 +35,9 @@ add_executable(gpu_blast
         tests_gpu_blast.cu  # Contains test_main()
 )
 
-# FIX: Link the library to "gpu_blast", not the old names
+# Links the library to "gpu_blast"
 target_link_libraries(gpu_blast PRIVATE CUDA::cudart)
+
+# This copies the 'ncbi_data' folder from the source root into the build folder
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/ncbi_data
+        DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
