@@ -7,6 +7,9 @@
 #include <bitset>
 #include <cmath>
 #include <stdexcept>
+#include <fstream>
+#include <string>
+#include <cctype>
 #include "gpu_blast.h"
 #include <cuda_runtime.h>
 
@@ -35,6 +38,31 @@
 //encoded binary sequence, because the last few bits are all zero padded.
 //Same goes for when we decode the final alignment. We need to pass along the length of valid bit pairs (i.e. characters)
 //so we dont decode all bits in the last byte of the uint8_t array.
+
+/////////////////////////////////////////////
+/////// Extract DNA sequence from fasta file
+/////////////////////////////////////////////
+std::vector<char> read_fasta(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Failed to open: " + path);
+
+    std::vector<char> seq;
+    std::string line;
+
+    int nBytes = 0;
+    int nChars = 0;
+
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == '>') continue; // skip header
+        for (unsigned char ch : line) {
+            if (std::isspace(ch)) continue;
+            ch = (unsigned char)std::toupper(ch);
+            if (ch=='A' || ch=='C' || ch=='G' || ch=='T')
+                seq.push_back((char)ch);
+        }
+    }
+    return seq;
+}
 
 
 /////////////////////////////////
@@ -193,14 +221,14 @@ LookupTable build_lookup_table_from_encoded(
 }
 
 
+
+
 /////////////////////////////
 /////////// Data Transfer ///
 /////////////////////////////
-void data_to_device() {
-    // Moving a full sequence from host to device global memory
-
-    // Define host and device pointers
-
+void copy_to_device(const uint8_t* h_seq, const int h_seq_nBytes, uint8_t* d_seq) {
+    CHECK_CUDA(cudaMalloc(&d_seq, h_seq_nBytes*sizeof(uint8_t)));
+    CHECK_CUDA(cudaMemcpy(&d_seq, h_seq, h_seq_nBytes*sizeof(uint8_t), cudaMemcpyHostToDevice));
 }
 
 
@@ -214,16 +242,23 @@ void launch_kernels() {
 
 
 int main() {
-    const char* query = "";
-    //todo: move query and query hash table from host to device global memory
+    std::vector<char> query_seq = read_fasta();
 
+    //todo: 1) encode query_seq
+    //todo: 2) create hash table for query_seq
+    //todo: 3) allocate device memory for query_seq, and hash_table
+    //todo: 4) build struct that holds pointer to query_seq (on device); pointer to hash_table (on device); nBytes interger and nChars (nChars == n DNA bases) integer
 
     // Process DB sequences one by one
     for (int si=0; si<DB_SIZE; si++) {
-        //todo: send full DB sequence si over from Host to Device global memory
+        std::vector<char> db_seq = read_fasta();
+
+        //todo: 5) encode db_seq
+        //todo: 6) allocate device memory for db_seq
+        //todo: 7) build struct that holds pointer to db_seq (on device); nBytes integer and nChars (nChars == n DNA bases) integer
+        //todo: 8) hand both the query struct and the db sequence struct directly over to the kernel function AS VALUE
 
         //todo: free memory of sequence si on device
-
     }
     //todo: free memory of query and and lookup table on device
 
