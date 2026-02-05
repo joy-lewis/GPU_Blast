@@ -111,14 +111,6 @@ void decoder(const uint8_t* input, size_t length, char* output) { //length==numb
 }
 
 
-/////////////////////////////
-/////////// Data Transfer ///
-/////////////////////////////
-void transfer_to_device() {
-    // Moving a full sequence from host to device global memory
-}
-
-
 ///////////////////////////////////
 ////////// Lookup Table Creation //
 ///////////////////////////////////
@@ -201,6 +193,18 @@ LookupTable build_lookup_table_from_encoded(
 }
 
 
+/////////////////////////////
+/////////// Data Transfer ///
+/////////////////////////////
+void data_to_device() {
+    // Moving a full sequence from host to device global memory
+
+    // Define host and device pointers
+
+}
+
+
+
 ////////////////////////////
 ////////// DNA Alignment //
 ///////////////////////////
@@ -208,7 +212,7 @@ void launch_kernels() {
     // Launching the kernels, i.e. blocks on the GPU device
 }
 
-/*
+
 int main() {
     const char* query = "";
     //todo: move query and query hash table from host to device global memory
@@ -226,4 +230,3 @@ int main() {
 
     return 0;
 }
-*/
