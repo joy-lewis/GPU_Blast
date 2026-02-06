@@ -31,12 +31,24 @@ struct SeqView {
     uint32_t nChars;      // number of DNA bases
 };
 
+
+struct Hit {
+    uint32_t db_pos;      // seed start in DB (char index)
+    uint32_t q_pos;       // seed start in query (char index)
+    int32_t  bestScore;   // best ungapped score after extension
+    int32_t  leftExt;     // how many bases extended to the left
+    int32_t  rightExt;    // how many bases extended to the right
+};
+
 struct KernelParamsView {
     SeqView query; // query sequence
     SeqView database; // database sequence
     LookupTableView lView;
-    uint32_t K;
+    Hit*      hits;        // global output array
+    uint32_t* hitCount;    // atomic counter in global memory
+    uint32_t  maxHits;      // capacity of hits[]
 };
+
 
 uint32_t base_at_msb4(const uint8_t* encoded_dna, uint32_t i);
 uint32_t kmer_at_msb_bytes(const uint8_t* encoded_dna, uint32_t pos, uint32_t k);

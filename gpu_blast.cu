@@ -10,6 +10,7 @@
 #include <fstream>
 #include <string>
 #include <cctype>
+#include <algorithm>
 #include "gpu_blast.h"
 #include <cuda_runtime.h>
 
@@ -18,9 +19,25 @@
 /////////// Define Hyperparameters //
 /////////////////////////////////////
 #define DB_SIZE 10 // number of sequences in Database
-#define K 8 // defines k-mer length
+#define K 8 // defines k-mer length // conditions: K>0
 
-// conditions: K>0
+#define NUM_THREADS_PER_BLOCK 256
+#define NUM_BLOCKS 4
+
+// Tile length in "characters" (DNA bases), cant be larger then (total-shared-memory-query-memory*NUM_BLOCKS) / NUM_BLOCKS
+// Example: 16384 chars => 4096 bytes.
+#define TILE_CHARS 16384u //todo:optimizable
+
+// Scoring function for matches during extension. +1 for match, -1 for non-match
+#define MATCH_SCORE 1
+#define MISMATCH_PENALTY -1
+
+// Minimal score to report
+#define MIN_REPORT_SCORE 8
+
+// X-drop termination condition to keep the extension finite
+#define X_DROP 4
+
 
 ////////////////////////////
 /////////// Sanity checks //
@@ -250,24 +267,264 @@ LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offset
 }
 
 
-/////////////////////////////
-/////////// Data Transfer ///
-/////////////////////////////
-void copy_to_device(const uint8_t* h_seq, const int h_seq_nBytes, uint8_t* d_seq) {
-    CHECK_CUDA(cudaMalloc(&d_seq, h_seq_nBytes*sizeof(uint8_t)));
-    CHECK_CUDA(cudaMemcpy(&d_seq, h_seq, h_seq_nBytes*sizeof(uint8_t), cudaMemcpyHostToDevice));
-}
-
-
-
 ////////////////////////////
 ////////// DNA Alignment //
 ///////////////////////////
-void launch_kernels() {
-    // Launching the kernels, i.e. blocks on the GPU device
+
+
+// leftmost 2-bit character (DNA base) extraction
+// Similar logic to what we used for the lookup table creation
+__device__ __forceinline__ uint32_t base_at_msb4_dev(const uint8_t* encoded_dna, uint32_t iChar) {
+    const uint32_t byte_idx = iChar >> 2;            // /4
+    const uint32_t in_byte  = iChar & 3u;            // 0..3
+    const uint32_t shift    = 6u - 2u * in_byte;     // 6,4,2,0
+    return (encoded_dna[byte_idx] >> shift) & 0x3u;
+}
+
+// k-mer extraction
+__device__ __forceinline__ uint32_t kmer_at_msb_bytes_dev(const uint8_t* encoded_dna,
+                                                          uint32_t posChar) {
+    uint32_t key = 0;
+    #pragma unroll
+    for (uint32_t j = 0; j < 32; ++j) {  // unroll upper bound; break at K
+        if (j >= K) break;
+        key = (key << 2) | base_at_msb4_dev(encoded_dna, posChar + j);
+    }
+    return key;
 }
 
 
+// Shared-tile accessor with global fallback
+struct Tile{
+    const uint8_t* db_global;
+    const uint8_t* tile_shared;  // packed bytes for tile
+    uint32_t startChar;      // start char index in global db
+    uint32_t nChars;          // number of valid chars in tile
+};
+
+__device__ __forceinline__ uint32_t tile_char_at(const Tile& acc, uint32_t dbCharIdx)
+{
+    // If inside tile, access shared; else access global
+    if (dbCharIdx >= acc.startChar && dbCharIdx < (acc.startChar + acc.nChars)) {
+        uint32_t local = dbCharIdx - acc.startChar;
+        return base_at_msb4_dev(acc.tile_shared, local);
+    } else {
+        return base_at_msb4_dev(acc.db_global, dbCharIdx);
+    }
+}
+
+
+// Simple ungapped extension around a seed
+__device__ __forceinline__ void ungapped_extend(
+    const uint8_t* q_shared,
+    const Tile& dbAcc,
+    uint32_t qLenChars,
+    uint32_t dbLenChars,
+    uint32_t qSeedPos,
+    uint32_t dbSeedPos,
+    int32_t& outBestScore,
+    int32_t& outLeftExt,
+    int32_t& outRightExt){
+
+    // Seed is exact match by construction
+    int32_t score = (int32_t)K * MATCH_SCORE;
+    int32_t best  = score;
+
+    int32_t bestLeft  = 0;
+    int32_t bestRight = 0;
+
+    // Left extension
+    int32_t cur = score;
+    int32_t leftExt = 0;
+    int32_t iQ  = (int32_t)qSeedPos - 1;
+    int32_t iDB = (int32_t)dbSeedPos - 1;
+    while (iQ >= 0 && iDB >= 0) {
+        const uint32_t qb  = base_at_msb4_dev(q_shared, (uint32_t)iQ);
+        const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
+        cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
+        leftExt++;
+
+        if (cur > best) {
+            best = cur;
+            bestLeft = leftExt;
+        }
+        if (cur < best - X_DROP) break;
+        --iQ; --iDB;
+    }
+
+    // Right extension
+    cur = best; // we continue from best-so-far of previous left extension
+    int32_t rightExt = 0;
+    iQ  = (int32_t)(qSeedPos + K);
+    iDB = (int32_t)(dbSeedPos + K);
+    while (iQ < (int32_t)qLenChars && iDB < (int32_t)dbLenChars) {
+        const uint32_t qb  = base_at_msb4_dev(q_shared, (uint32_t)iQ);
+        const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
+        cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
+        rightExt++;
+
+        if (cur > best) {
+            best = cur;
+            bestRight = rightExt;
+        }
+        if (cur < best - X_DROP) break;
+
+        ++iQ; ++iDB;
+    }
+
+    outBestScore = best;
+    outLeftExt   = bestLeft;
+    outRightExt  = bestRight;
+}
+
+
+// Main BLAST kernel who is responsible for the tiling process
+__global__ void blast(KernelParamsView params)
+{
+    // To not exceed our thread budget
+    if (blockDim.x != NUM_THREADS_PER_BLOCK) return;
+
+    const uint32_t qLen = params.query.nChars;
+    const uint32_t dbLen = params.database.nChars;
+
+    // Shared memory layout:
+    // [ query_bytes ][ tile_bytes ]
+    extern __shared__ uint8_t shared_mem[];
+    uint8_t* q_sh = shared_mem;
+
+    const uint32_t qBytes = params.query.nBytes;
+    const uint32_t tileBytesMax = (TILE_CHARS + 3u) >> 2; // /4 rounded up
+    uint8_t* tile_sh = q_sh + qBytes;
+
+    // 1) Load query into shared (all blocks do this in parallel)
+    for (uint32_t i = threadIdx.x; i < qBytes; i += blockDim.x) {
+        q_sh[i] = params.query.seq[i];
+    }
+    __syncthreads(); // wait till the full query is loaded into shared memory
+
+    // 2) Every block has its pre-determined set of tiles: tileId = blockIdx.x
+    //  which gets updated in each iteration with tileId = tileId + gridDim.x
+    const uint32_t tilesTotal = (dbLen + TILE_CHARS - 1u) / TILE_CHARS;
+
+    for (uint32_t tileId = (uint32_t) blockIdx.x; tileId < tilesTotal; tileId += (uint32_t) gridDim.x) {
+
+        const uint32_t tileStartChar = tileId * TILE_CHARS;
+        const uint32_t tileChars = min(TILE_CHARS, dbLen - tileStartChar);
+        const uint32_t tileBytes = (tileChars + 3u) >> 2;
+
+        // 2a) Load this tile’s encoded bytes into shared memory
+        const uint32_t tileStartByte = tileStartChar >> 2; // /4
+        for (uint32_t i = threadIdx.x; i < tileBytes; i += blockDim.x) {
+            tile_sh[i] = params.database.seq[tileStartByte + i];
+        }
+        __syncthreads(); // wait till tiles are fully loaded
+
+        // Define current tile
+        Tile dbAcc;
+        dbAcc.db_global = params.database.seq;
+        dbAcc.tile_shared = tile_sh;
+        dbAcc.startChar = tileStartChar;
+        dbAcc.nChars = tileChars;
+
+        // 3) Each thread processes start positions in this tile: start = tileStartChar + tid
+        // then += blockDim.x (i.e. each thread pulls its next seed with a offset of NUM_THREADS_PER_BLOCK)
+        for (uint32_t dbPos = tileStartChar + (uint32_t) threadIdx.x;
+             dbPos < tileStartChar + tileChars;
+             dbPos += (uint32_t) blockDim.x) {
+
+            // sanity checks
+            if (dbPos + K > dbLen) continue;
+            if (K == 0 || qLen < K) continue;
+
+            // Build k-mer key from database sequence at dbPos.
+            // Uses shared tile for speed when inside tile; but kmer_at expects a pointer.
+            // So we compute by reading character-by-character via tile_char_at().
+            uint32_t key = 0;
+            #pragma unroll
+            for (uint32_t j = 0; j < 32; ++j) {
+                if (j >= K) break;
+                key = (key << 2) | tile_char_at(dbAcc, dbPos + j);
+            }
+
+            // Finding matches for this k-mer in query lookup table
+            if (key + 1u >= params.lView.nOffsets) continue; // to avoid out of bounds errors
+            const uint32_t start = params.lView.offsets[key];
+            const uint32_t end   = params.lView.offsets[key + 1u];
+
+            // We perform an extension for each match position in query
+            for (uint32_t idx = start; idx < end; ++idx) {
+                if (idx >= params.lView.nPositions) break;
+                const uint32_t qPos = params.lView.positions[idx];
+
+                if (qPos + K > qLen) continue; // to avoid out of bounds errors
+
+                int32_t bestScore, leftExt, rightExt;
+                ungapped_extend(q_sh, dbAcc, qLen, dbLen, qPos, dbPos,
+                                bestScore, leftExt, rightExt);
+
+                if (bestScore >= MIN_REPORT_SCORE) {
+                    // Append to global output
+                    uint32_t outIdx = atomicAdd(params.hitCount, 1u);
+                    if (outIdx < params.maxHits) { // out of memory check
+                        Hit h;
+                        h.db_pos     = dbPos;
+                        h.q_pos      = qPos;
+                        h.bestScore  = bestScore;
+                        h.leftExt    = leftExt;
+                        h.rightExt   = rightExt;
+                        params.hits[outIdx] = h;
+                    }
+                }
+            }
+        }
+
+        __syncthreads(); // before next tile load
+    }
+}
+
+
+void save_results(const uint32_t* d_hitCount, uint32_t maxHits, const Hit* d_hits, int si) {
+    // 4) Copy back hitCount
+    uint32_t h_hitCount = 0;
+    CHECK_CUDA(cudaMemcpy(&h_hitCount, d_hitCount, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    // Copy only as many hits as fit in the allocated buffer
+    uint32_t nToCopy = std::min(h_hitCount, maxHits);
+
+    // 5) Copy back hits
+    std::vector<Hit> h_hits(nToCopy);
+    if (nToCopy > 0) {
+        CHECK_CUDA(cudaMemcpy(h_hits.data(), d_hits, nToCopy * sizeof(Hit), cudaMemcpyDeviceToHost));
+    }
+
+    // 6) Save to txt (one file per DB sequence)
+    {
+        std::string outName = "blast_results_sequence" + std::to_string(si) + ".txt";
+        std::ofstream out(outName, std::ios::out);
+
+        if (!out) {
+            std::cerr << "Failed to open output file: " << outName << "\n";
+        } else {
+            out << "DB sequence index: " << si << "\n";
+            out << "Device hitCount (may exceed cap): " << h_hitCount << "\n";
+            out << "Hits written (clamped to cap): " << nToCopy << "\n";
+            out << "Columns: db_pos q_pos bestScore leftExt rightExt\n";
+
+            for (uint32_t i = 0; i < nToCopy; ++i) {
+                const Hit& h = h_hits[i];
+                out << h.db_pos << " "
+                    << h.q_pos << " "
+                    << h.bestScore << " "
+                    << h.leftExt << " "
+                    << h.rightExt << "\n";
+            }
+        }
+    }
+}
+
+////////////////////////////
+////////// MAIN FUNCTION //
+///////////////////////////
 int blast_main() {
     // Load DNA sequences from database
     char query_name[32];
@@ -323,19 +580,45 @@ int blast_main() {
             (uint32_t) db_nChars
         };
 
+        // Allocate memory for outputs on device
+        uint32_t MAX_HITS = 1u << 20; // roughly over 1 million, must be enough memory for counter
+        Hit* d_hits;
+        uint32_t* d_hitCount;
+        CHECK_CUDA(cudaMalloc(&d_hits, MAX_HITS * sizeof(Hit)));
+        CHECK_CUDA(cudaMalloc(&d_hitCount, sizeof(uint32_t)));
+        CHECK_CUDA(cudaMemset(d_hitCount, 0, sizeof(uint32_t)));
+
         // Define parameters for the kernel function
         KernelParamsView params {
             q,
             db,
             lView,
-            (uint32_t)K
+            d_hits,
+            d_hitCount,
+        MAX_HITS
         };
 
-        // Handing both the query sequence and the database sequence in i shared struct directly over to the kernel function AS VALUE
-        //todo: kernel call
+        // Handing both the query sequence and the database sequence in a shared struct directly over to the kernel function AS VALUE
+        dim3 threadsPerBlock(256, 1);
+        dim3 blocksPerGrid(4, 1);
+        std::cout << "Launching kernel with " << blocksPerGrid.x * blocksPerGrid.y << " blocks each with " << threadsPerBlock.x * threadsPerBlock.y << " threads\n";
 
+        const uint32_t qBytes = q.nBytes;
+        const uint32_t tileBytesMax = (TILE_CHARS + 3u) >> 2;   // bytes needed for TILE_CHARS
+        size_t shmemBytes = (size_t)qBytes + (size_t)tileBytesMax;
+
+        blast<<<blocksPerGrid, threadsPerBlock, shmemBytes>>>(params); // shmemBytes ensures we dont use more shared memory then we have available
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        save_results(d_hitCount, MAX_HITS, d_hits, si);
+
+        free(db_encoder_out);
         CHECK_CUDA(cudaFree(d_db));
+        CHECK_CUDA(cudaFree(d_hits));
+        CHECK_CUDA(cudaFree(d_hitCount));
     }
+    free(query_encoder_out);
     CHECK_CUDA(cudaFree(d_query));
     CHECK_CUDA(cudaFree(d_offsets));
     CHECK_CUDA(cudaFree(d_positions));
