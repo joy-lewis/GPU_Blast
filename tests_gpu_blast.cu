@@ -68,7 +68,7 @@ int test_main() {
     const uint32_t L = N - k + 1u;
     const uint32_t M = 1u << (2u * k);
 
-    LookupTableView lut = build_lookup_table_from_encoded(encoder_out, N, k);
+    LookupTable lut = build_lookup_table_from_encoded(encoder_out, N, k);
 
     std::cout << "Lookup table test (k=" << k << ")\n";
     std::cout << "N=" << N << ", L=" << L << ", M=" << M << "\n";

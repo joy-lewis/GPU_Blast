@@ -288,26 +288,17 @@ int blast_main() {
     CHECK_CUDA(cudaMalloc(&d_query, query_nBytes));
     CHECK_CUDA(cudaMemcpy(d_query, query_encoder_out, query_nBytes, cudaMemcpyHostToDevice));
 
-    // Create lookup table for query sequence
-    LookupTable lTable = build_lookup_table_from_encoded(query_encoder_out, query_nChars, K);
-
-    // Send lookup table to device
-    uint32_t *d_offsets, *d_positions;
-    LookupTableView lView = lookup_table_to_device(lTable, &d_offsets, &d_positions);
-
-    // Define parameter
     SeqView q {
         d_query,
         (uint32_t) query_nBytes,
         (uint32_t) query_nChars
     };
 
-    KernelParamsView params {
-        q,
-        lView,
-        (uint32_t)K
-    };
-
+    // Create lookup table for query sequence
+    LookupTable lTable = build_lookup_table_from_encoded(query_encoder_out, query_nChars, K);
+    // Send lookup table to device
+    uint32_t *d_offsets, *d_positions;
+    LookupTableView lView = lookup_table_to_device(lTable, &d_offsets, &d_positions);
 
     // Process DB sequences one by one
     for (int si=1; si<=DB_SIZE; si++) {
@@ -321,14 +312,33 @@ int blast_main() {
         uint8_t* db_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * db_nBytes);
         encoder(db_seq, db_nChars, db_encoder_out);
 
-        //todo: 6) allocate device memory for db_seq
-        //todo: 7) build struct that holds pointer to db_seq (on device); nBytes integer and nChars (nChars == n DNA bases) integer
-        //todo: 8) hand both the query struct and the db sequence struct directly over to the kernel function AS VALUE
+        // Allocate memory on device for database sequence
+        uint8_t* d_db;
+        CHECK_CUDA(cudaMalloc(&d_db, db_nBytes));
+        CHECK_CUDA(cudaMemcpy(d_db, db_encoder_out, db_nBytes, cudaMemcpyHostToDevice));
 
-        //todo: free memory of sequence si on device
+        SeqView db {
+            d_db,
+            (uint32_t) db_nBytes,
+            (uint32_t) db_nChars
+        };
+
+        // Define parameters for the kernel function
+        KernelParamsView params {
+            q,
+            db,
+            lView,
+            (uint32_t)K
+        };
+
+        // Handing both the query sequence and the database sequence in i shared struct directly over to the kernel function AS VALUE
+        //todo: kernel call
+
+        CHECK_CUDA(cudaFree(d_db));
     }
-    //todo: free memory of query and and lookup table on device
-
+    CHECK_CUDA(cudaFree(d_query));
+    CHECK_CUDA(cudaFree(d_offsets));
+    CHECK_CUDA(cudaFree(d_positions));
 
     return 0;
 }

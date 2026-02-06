@@ -32,7 +32,8 @@ struct SeqView {
 };
 
 struct KernelParamsView {
-    SeqView query;
+    SeqView query; // query sequence
+    SeqView database; // database sequence
     LookupTableView lView;
     uint32_t K;
 };
