@@ -10,6 +10,7 @@
 #include <fstream>
 #include <string>
 #include <cctype>
+#include <filesystem>
 #include <algorithm>
 #include "gpu_blast.h"
 #include <cuda_runtime.h>
@@ -19,7 +20,7 @@
 /////////// Define Hyperparameters //
 /////////////////////////////////////
 #define DB_SIZE 10 // number of sequences in Database
-#define K 8 // defines k-mer length // conditions: K>0
+#define K 12 // defines k-mer length // conditions: K>0
 
 #define NUM_THREADS_PER_BLOCK 256
 #define NUM_BLOCKS 4
@@ -33,7 +34,7 @@
 #define MISMATCH_PENALTY -1
 
 // Minimal score to report
-#define MIN_REPORT_SCORE 8
+#define MIN_REPORT_SCORE K+1 // this way we only record matches where the alignment is larger then the seed k-mer
 
 // X-drop termination condition to keep the extension finite
 #define X_DROP 4
@@ -495,29 +496,40 @@ void save_results(const uint32_t* d_hitCount, uint32_t maxHits, const Hit* d_hit
     std::vector<Hit> h_hits(nToCopy);
     if (nToCopy > 0) {
         CHECK_CUDA(cudaMemcpy(h_hits.data(), d_hits, nToCopy * sizeof(Hit), cudaMemcpyDeviceToHost));
+
+        // sort alignments by length
+        std::sort(h_hits.begin(), h_hits.end(),
+                  [](const Hit& a, const Hit& b) {
+                      if (a.bestScore != b.bestScore) return a.bestScore > b.bestScore;
+                      if (a.db_pos != b.db_pos) return a.db_pos < b.db_pos;
+                      return a.q_pos < b.q_pos;
+                  });
     }
 
-    // 6) Save to txt (one file per DB sequence)
-    {
-        std::string outName = "blast_results_sequence" + std::to_string(si) + ".txt";
-        std::ofstream out(outName, std::ios::out);
+    // save results to txt file
 
-        if (!out) {
-            std::cerr << "Failed to open output file: " << outName << "\n";
-        } else {
-            out << "DB sequence index: " << si << "\n";
-            out << "Device hitCount (may exceed cap): " << h_hitCount << "\n";
-            out << "Hits written (clamped to cap): " << nToCopy << "\n";
-            out << "Columns: db_pos q_pos bestScore leftExt rightExt\n";
+    namespace fs = std::filesystem;
+    fs::create_directories("results"); // no-op if it already exists
 
-            for (uint32_t i = 0; i < nToCopy; ++i) {
-                const Hit& h = h_hits[i];
-                out << h.db_pos << " "
-                    << h.q_pos << " "
-                    << h.bestScore << " "
-                    << h.leftExt << " "
-                    << h.rightExt << "\n";
-            }
+    std::string outName = (fs::path("results") /
+                               ("blast_results_sequence" + std::to_string(si) + ".txt")).string();
+    std::ofstream out(outName, std::ios::out);
+
+    if (!out) {
+        std::cerr << "Failed to open output file: " << outName << "\n";
+    } else {
+        out << "DB sequence index: " << si << "\n";
+        out << "Device hitCount (may exceed cap): " << h_hitCount << "\n";
+        out << "Hits written (clamped to cap): " << nToCopy << "\n";
+        out << "Columns: db_pos q_pos bestScore leftExt rightExt\n";
+
+        for (uint32_t i = 0; i < nToCopy; ++i) {
+            const Hit& h = h_hits[i];
+            out << h.db_pos << " "
+                << h.q_pos << " "
+                << h.bestScore << " "
+                << h.leftExt << " "
+                << h.rightExt << "\n";
         }
     }
 }
@@ -613,10 +625,16 @@ int blast_main() {
 
         save_results(d_hitCount, MAX_HITS, d_hits, si);
 
+        // sanity check
+        uint32_t h_hitCount = 0;
+        CHECK_CUDA(cudaMemcpy(&h_hitCount, d_hitCount, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        std::cout << "DB " << si << " hitCount=" << h_hitCount << " (cap " << MAX_HITS << ")\n";
+
         free(db_encoder_out);
         CHECK_CUDA(cudaFree(d_db));
         CHECK_CUDA(cudaFree(d_hits));
         CHECK_CUDA(cudaFree(d_hitCount));
+        break;
     }
     free(query_encoder_out);
     CHECK_CUDA(cudaFree(d_query));
