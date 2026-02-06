@@ -181,9 +181,9 @@ uint32_t kmer_at_msb_bytes(const uint8_t* encoded_dna,
 
 
 LookupTable build_lookup_table_from_encoded(
-    const uint8_t* encoded_dna,  // packed 2-bit bases (4 per byte, MSB-first)
-    uint32_t N,                  // total number of bases in the query
-    uint32_t k                   // k-mer length in bases
+    const uint8_t* encoded_dna,  // packed 2-bit characters (4 per byte, MSB-first)
+    uint32_t N,                  // total number of characters in the query
+    uint32_t k                   // k-mer length in characters
 ){
 
     if (2u * k >= 32u) {
@@ -221,6 +221,33 @@ LookupTable build_lookup_table_from_encoded(
 }
 
 
+// Handles memory allocation on device and copies the lookup table contents over to the device
+LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offsets_out, uint32_t** d_positions_out) {
+    uint32_t* d_offsets;
+    uint32_t* d_positions;
+
+    CHECK_CUDA(cudaMalloc(&d_offsets, t.offsets.size() * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_positions, t.positions.size() * sizeof(uint32_t)));
+
+    CHECK_CUDA(cudaMemcpy(d_offsets, t.offsets.data(),
+                          t.offsets.size() * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+
+    CHECK_CUDA(cudaMemcpy(d_positions, t.positions.data(),
+                          t.positions.size() * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+
+    // returns device pointers
+    *d_offsets_out = d_offsets;
+    *d_positions_out = d_positions;
+
+    return LookupTableView{
+        d_offsets,
+        d_positions,
+        (uint32_t)t.offsets.size(),
+        (uint32_t)t.positions.size()
+    };
+}
 
 
 /////////////////////////////
@@ -246,26 +273,54 @@ int blast_main() {
     char query_name[32];
     char db_name[32];
 
+    // Read in the seqeunce from file
     snprintf(query_name, sizeof(query_name), "ncbi_data/query.fasta");
     std::vector<char> query_seq = read_fasta(query_name);
     const int query_nChars = query_seq.size();
 
     // Encode query sequence to 2-bit encoding
     const int query_nBytes = (query_nChars + 3) / 4; // 4 bases per byte
-    uint8_t* encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
-    encoder(query_seq, query_nChars, encoder_out);
+    uint8_t* query_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
+    encoder(query_seq, query_nChars, query_encoder_out);
 
-    //todo: 2) create hash table for query_seq
-    //todo: 3) allocate device memory for query_seq, and hash_table
-    //todo: 4) build struct that holds pointer to query_seq (on device); pointer to hash_table (on device); nBytes interger and nChars (nChars == n DNA bases) integer
+    // Allocate memory on device for query sequence and lookup table
+    uint8_t* d_query;
+    CHECK_CUDA(cudaMalloc(&d_query, query_nBytes));
+    CHECK_CUDA(cudaMemcpy(d_query, query_encoder_out, query_nBytes, cudaMemcpyHostToDevice));
+
+    // Create lookup table for query sequence
+    LookupTable lTable = build_lookup_table_from_encoded(query_encoder_out, query_nChars, K);
+
+    // Send lookup table to device
+    uint32_t *d_offsets, *d_positions;
+    LookupTableView lView = lookup_table_to_device(lTable, &d_offsets, &d_positions);
+
+    // Define parameter
+    SeqView q {
+        d_query,
+        (uint32_t) query_nBytes,
+        (uint32_t) query_nChars
+    };
+
+    KernelParamsView params {
+        q,
+        lView,
+        (uint32_t)K
+    };
+
 
     // Process DB sequences one by one
     for (int si=1; si<=DB_SIZE; si++) {
+        // Read in the sequence from file
         snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.fasta", si);
-
         std::vector<char> db_seq = read_fasta(db_name);
+        const int db_nChars = db_seq.size();
 
-        //todo: 5) encode db_seq
+        // Encode database sequence to 2-bit encoding
+        const int db_nBytes = (db_nChars + 3) / 4; // 4 bases per byte
+        uint8_t* db_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * db_nBytes);
+        encoder(db_seq, db_nChars, db_encoder_out);
+
         //todo: 6) allocate device memory for db_seq
         //todo: 7) build struct that holds pointer to db_seq (on device); nBytes integer and nChars (nChars == n DNA bases) integer
         //todo: 8) hand both the query struct and the db sequence struct directly over to the kernel function AS VALUE
