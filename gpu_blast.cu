@@ -634,7 +634,6 @@ int blast_main() {
         CHECK_CUDA(cudaFree(d_db));
         CHECK_CUDA(cudaFree(d_hits));
         CHECK_CUDA(cudaFree(d_hitCount));
-        break;
     }
     free(query_encoder_out);
     CHECK_CUDA(cudaFree(d_query));

@@ -1,43 +1,26 @@
-#cmake_minimum_required(VERSION 3.18)
-#project(gpu_blast LANGUAGES CXX CUDA)
-#
-#set(CMAKE_CXX_STANDARD 17)
-#set(CMAKE_CUDA_STANDARD 17)
-#
-#find_package(CUDAToolkit REQUIRED)
-
-###
-#add_executable(gpu_blast_app
-#        gpu_blast.cu
-#)
-#
-#add_executable(test
-#        tests_gpu_blast.cu
-#        # plus any .cu/.cpp files that contain functions the tests need,
-#        # BUT do NOT include gpu_blast.cu if it contains main()
-#)
-
-#target_link_libraries(gpu_blast_app PRIVATE CUDA::cudart)
-#target_link_libraries(test         PRIVATE CUDA::cudart)
-
 cmake_minimum_required(VERSION 3.18)
+
+# 1. Point to your specific Anaconda CUDA compiler
+set(CMAKE_CUDA_COMPILER /home/joy/anaconda3/envs/bw312/bin/nvcc)
+
 project(gpu_blast LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-find_package(CUDAToolkit REQUIRED)
-
-# This creates the single executable "gpu_blast"
+# 2. Define the main executable
+# Removed duplicates to prevent "multiple definition" errors
 add_executable(gpu_blast
-        main.cu             # The file with the real main()
-        gpu_blast.cu        # Contains blast_main() and encoder()
-        tests_gpu_blast.cu  # Contains test_main()
+        main.cu
+        gpu_blast.cu
+        gpu_blast.h
+        lookup_table.cuh
 )
 
-# Links the library to "gpu_blast"
+# 3. Link CUDA runtime
+find_package(CUDAToolkit REQUIRED)
 target_link_libraries(gpu_blast PRIVATE CUDA::cudart)
 
-# This copies the 'ncbi_data' folder from the source root into the build folder
+# 4. Copy data to build folder
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/ncbi_data
         DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
