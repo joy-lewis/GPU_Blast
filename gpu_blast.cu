@@ -23,7 +23,8 @@
 #define K 12 // defines k-mer length // conditions: K>0
 
 #define NUM_THREADS_PER_BLOCK 256
-#define NUM_BLOCKS 4
+// #define NUM_BLOCKS 4
+
 
 // Tile length in "characters" (DNA bases), cant be larger then (total-shared-memory-query-memory*NUM_BLOCKS) / NUM_BLOCKS
 // Example: 16384 chars => 4096 bytes.
@@ -412,13 +413,18 @@ __global__ void blast(KernelParamsView params)
         const uint32_t tileStartChar = tileId * TILE_CHARS;
         const uint32_t tileChars = min(TILE_CHARS, dbLen - tileStartChar);
         const uint32_t tileBytes = (tileChars + 3u) >> 2;
+        const uint32_t tileStartByte = tileStartChar >> 2;
 
-        // 2a) Load this tile’s encoded bytes into shared memory
-        const uint32_t tileStartByte = tileStartChar >> 2; // /4
-        for (uint32_t i = threadIdx.x; i < tileBytes; i += blockDim.x) {
-            tile_sh[i] = params.database.seq[tileStartByte + i];
+        // 2a) loading this tile’s encoded bytes into shared memory using vectorized loads
+        // This addresses the "UncoalescedGlobalAccess" bottleneck in your Nsight profile.
+        uint32_t* tile_sh_32 = (uint32_t*)tile_sh;
+        uint32_t* db_global_32 = (uint32_t*)&params.database.seq[tileStartByte];
+
+        // we divide tileBytes by 4 because each thread now loads 4 bytes (32 bits, 16 DNA bases) at once
+        for (uint32_t i = threadIdx.x; i < (tileBytes + 3) / 4; i += blockDim.x) {
+            tile_sh_32[i] = db_global_32[i]; // Coalesced 32-bit load
         }
-        __syncthreads(); // wait till tiles are fully loaded
+        __syncthreads(); // Wait until the entire tile is loaded into shared memory
 
         // Define current tile
         Tile dbAcc;
@@ -537,108 +543,168 @@ void save_results(const uint32_t* d_hitCount, uint32_t maxHits, const Hit* d_hit
 ////////////////////////////
 ////////// MAIN FUNCTION //
 ///////////////////////////
-int blast_main() {
-    // Load DNA sequences from database
-    char query_name[32];
-    char db_name[32];
+///
+/// sequential loop
+// int blast_main() {
+//     // Load DNA sequences from database
+//     char query_name[32];
+//     char db_name[32];
+//
+//     // Read in the seqeunce from file
+//     snprintf(query_name, sizeof(query_name), "ncbi_data/query.fasta");
+//     std::vector<char> query_seq = read_fasta(query_name);
+//     const int query_nChars = query_seq.size();
+//
+//     // Encode query sequence to 2-bit encoding
+//     const int query_nBytes = (query_nChars + 3) / 4; // 4 bases per byte
+//     uint8_t* query_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
+//     encoder(query_seq, query_nChars, query_encoder_out);
+//
+//     // Allocate memory on device for query sequence and lookup table
+//     uint8_t* d_query;
+//     CHECK_CUDA(cudaMalloc(&d_query, query_nBytes));
+//     CHECK_CUDA(cudaMemcpy(d_query, query_encoder_out, query_nBytes, cudaMemcpyHostToDevice));
+//
+//     SeqView q {
+//         d_query,
+//         (uint32_t) query_nBytes,
+//         (uint32_t) query_nChars
+//     };
+//
+//     // Create lookup table for query sequence
+//     LookupTable lTable = build_lookup_table_from_encoded(query_encoder_out, query_nChars, K);
+//     // Send lookup table to device
+//     uint32_t *d_offsets, *d_positions;
+//     LookupTableView lView = lookup_table_to_device(lTable, &d_offsets, &d_positions);
+//
+//     // Process DB sequences one by one
+//     for (int si=1; si<=DB_SIZE; si++) {
+//         // Read in the sequence from file
+//         snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.fasta", si);
+//         std::vector<char> db_seq = read_fasta(db_name);
+//         const int db_nChars = db_seq.size();
+//
+//         // Encode database sequence to 2-bit encoding
+//         const int db_nBytes = (db_nChars + 3) / 4; // 4 bases per byte
+//         uint8_t* db_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * db_nBytes);
+//         encoder(db_seq, db_nChars, db_encoder_out);
+//
+//         // Allocate memory on device for database sequence
+//         uint8_t* d_db;
+//         CHECK_CUDA(cudaMalloc(&d_db, db_nBytes));
+//         CHECK_CUDA(cudaMemcpy(d_db, db_encoder_out, db_nBytes, cudaMemcpyHostToDevice));
+//
+//         SeqView db {
+//             d_db,
+//             (uint32_t) db_nBytes,
+//             (uint32_t) db_nChars
+//         };
+//
+//         // Allocate memory for outputs on device
+//         uint32_t MAX_HITS = 1u << 20; // roughly over 1 million, must be enough memory for counter
+//         Hit* d_hits;
+//         uint32_t* d_hitCount;
+//         CHECK_CUDA(cudaMalloc(&d_hits, MAX_HITS * sizeof(Hit)));
+//         CHECK_CUDA(cudaMalloc(&d_hitCount, sizeof(uint32_t)));
+//         CHECK_CUDA(cudaMemset(d_hitCount, 0, sizeof(uint32_t)));
+//
+//         // Define parameters for the kernel function
+//         KernelParamsView params {
+//             q,
+//             db,
+//             lView,
+//             d_hits,
+//             d_hitCount,
+//         MAX_HITS
+//         };
+//
+//
+//         // we find out how many SMs are available on the GPU to avoid SMs standing idle
+//         // we launch one block for each SM
+//         int deviceId;
+//         cudaGetDevice(&deviceId);
+//         cudaDeviceProp props;
+//         cudaGetDeviceProperties(&props, deviceId);
+//
+//         // Launch more blocks than SMs to allow the hardware to schedule work efficiently
+//         //props.multiProcessorCount is the number of SMs (e.g., 188)
+//         dim3 blocksPerGrid(props.multiProcessorCount, 1);
+//         // Handing both the query sequence and the database sequence in a shared struct directly over to the kernel function AS VALUE
+//         dim3 threadsPerBlock(256, 1);
+//
+//         std::cout << "Launching kernel with " << blocksPerGrid.x * blocksPerGrid.y << " blocks each with " << threadsPerBlock.x * threadsPerBlock.y << " threads\n";
+//
+//         const uint32_t qBytes = q.nBytes;
+//         const uint32_t tileBytesMax = (TILE_CHARS + 3u) >> 2;   // bytes needed for TILE_CHARS
+//         size_t shmemBytes = (size_t)qBytes + (size_t)tileBytesMax;
+//
+//         blast<<<blocksPerGrid, threadsPerBlock, shmemBytes>>>(params); // shmemBytes ensures we dont use more shared memory then we have available
+//         CHECK_CUDA(cudaGetLastError());
+//         CHECK_CUDA(cudaDeviceSynchronize());
+//
+//         save_results(d_hitCount, MAX_HITS, d_hits, si);
+//
+//         // sanity check
+//         uint32_t h_hitCount = 0;
+//         CHECK_CUDA(cudaMemcpy(&h_hitCount, d_hitCount, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+//         std::cout << "DB " << si << " hitCount=" << h_hitCount << " (cap " << MAX_HITS << ")\n";
+//
+//         free(db_encoder_out);
+//         CHECK_CUDA(cudaFree(d_db));
+//         CHECK_CUDA(cudaFree(d_hits));
+//         CHECK_CUDA(cudaFree(d_hitCount));
+//     }
+//     free(query_encoder_out);
+//     CHECK_CUDA(cudaFree(d_query));
+//     CHECK_CUDA(cudaFree(d_offsets));
+//     CHECK_CUDA(cudaFree(d_positions));
+//
+//     return 0;
+// }
 
-    // Read in the seqeunce from file
-    snprintf(query_name, sizeof(query_name), "ncbi_data/query.fasta");
-    std::vector<char> query_seq = read_fasta(query_name);
-    const int query_nChars = query_seq.size();
 
-    // Encode query sequence to 2-bit encoding
-    const int query_nBytes = (query_nChars + 3) / 4; // 4 bases per byte
-    uint8_t* query_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * query_nBytes);
-    encoder(query_seq, query_nChars, query_encoder_out);
 
-    // Allocate memory on device for query sequence and lookup table
-    uint8_t* d_query;
-    CHECK_CUDA(cudaMalloc(&d_query, query_nBytes));
-    CHECK_CUDA(cudaMemcpy(d_query, query_encoder_out, query_nBytes, cudaMemcpyHostToDevice));
+/// 4-way concurrent loop
+///
+///
+///
 
-    SeqView q {
-        d_query,
-        (uint32_t) query_nBytes,
-        (uint32_t) query_nChars
-    };
 
-    // Create lookup table for query sequence
-    LookupTable lTable = build_lookup_table_from_encoded(query_encoder_out, query_nChars, K);
-    // Send lookup table to device
-    uint32_t *d_offsets, *d_positions;
-    LookupTableView lView = lookup_table_to_device(lTable, &d_offsets, &d_positions);
+pinned memory
 
-    // Process DB sequences one by one
-    for (int si=1; si<=DB_SIZE; si++) {
-        // Read in the sequence from file
-        snprintf(db_name, sizeof(db_name), "ncbi_data/sequence%d.fasta", si);
-        std::vector<char> db_seq = read_fasta(db_name);
-        const int db_nChars = db_seq.size();
-
-        // Encode database sequence to 2-bit encoding
-        const int db_nBytes = (db_nChars + 3) / 4; // 4 bases per byte
-        uint8_t* db_encoder_out = (uint8_t*) std::malloc(sizeof(uint8_t) * db_nBytes);
-        encoder(db_seq, db_nChars, db_encoder_out);
-
-        // Allocate memory on device for database sequence
-        uint8_t* d_db;
-        CHECK_CUDA(cudaMalloc(&d_db, db_nBytes));
-        CHECK_CUDA(cudaMemcpy(d_db, db_encoder_out, db_nBytes, cudaMemcpyHostToDevice));
-
-        SeqView db {
-            d_db,
-            (uint32_t) db_nBytes,
-            (uint32_t) db_nChars
-        };
-
-        // Allocate memory for outputs on device
-        uint32_t MAX_HITS = 1u << 20; // roughly over 1 million, must be enough memory for counter
-        Hit* d_hits;
-        uint32_t* d_hitCount;
-        CHECK_CUDA(cudaMalloc(&d_hits, MAX_HITS * sizeof(Hit)));
-        CHECK_CUDA(cudaMalloc(&d_hitCount, sizeof(uint32_t)));
-        CHECK_CUDA(cudaMemset(d_hitCount, 0, sizeof(uint32_t)));
-
-        // Define parameters for the kernel function
-        KernelParamsView params {
-            q,
-            db,
-            lView,
-            d_hits,
-            d_hitCount,
-        MAX_HITS
-        };
-
-        // Handing both the query sequence and the database sequence in a shared struct directly over to the kernel function AS VALUE
-        dim3 threadsPerBlock(256, 1);
-        dim3 blocksPerGrid(4, 1);
-        std::cout << "Launching kernel with " << blocksPerGrid.x * blocksPerGrid.y << " blocks each with " << threadsPerBlock.x * threadsPerBlock.y << " threads\n";
-
-        const uint32_t qBytes = q.nBytes;
-        const uint32_t tileBytesMax = (TILE_CHARS + 3u) >> 2;   // bytes needed for TILE_CHARS
-        size_t shmemBytes = (size_t)qBytes + (size_t)tileBytesMax;
-
-        blast<<<blocksPerGrid, threadsPerBlock, shmemBytes>>>(params); // shmemBytes ensures we dont use more shared memory then we have available
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA(cudaDeviceSynchronize());
-
-        save_results(d_hitCount, MAX_HITS, d_hits, si);
-
-        // sanity check
-        uint32_t h_hitCount = 0;
-        CHECK_CUDA(cudaMemcpy(&h_hitCount, d_hitCount, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        std::cout << "DB " << si << " hitCount=" << h_hitCount << " (cap " << MAX_HITS << ")\n";
-
-        free(db_encoder_out);
-        CHECK_CUDA(cudaFree(d_db));
-        CHECK_CUDA(cudaFree(d_hits));
-        CHECK_CUDA(cudaFree(d_hitCount));
-    }
-    free(query_encoder_out);
-    CHECK_CUDA(cudaFree(d_query));
-    CHECK_CUDA(cudaFree(d_offsets));
-    CHECK_CUDA(cudaFree(d_positions));
-
-    return 0;
+// Create multiple streams (e.g., 4 streams for 4-way concurrency)
+const int nStreams = 4;
+cudaStream_t streams[nStreams];
+for (int i = 0; i < nStreams; i++) {
+    CHECK_CUDA(cudaStreamCreate(&streams[i]));
 }
+
+// Use Pinned Memory for the hit counter and results on the host
+// This is required for cudaMemcpyAsync to actually overlap [cite: 683]
+uint32_t* h_hitCounts;
+Hit* h_all_hits;
+CHECK_CUDA(cudaMallocHost(&h_hitCounts, DB_SIZE * sizeof(uint32_t)));
+CHECK_CUDA(cudaMallocHost(&h_all_hits, DB_SIZE * MAX_HITS * sizeof(Hit)));
+
+
+for (int si = 1; si <= DB_SIZE; si++) {
+    int sIdx = (si - 1) % nStreams; // Cycle through your 4 streams
+
+    // ... (Encoding logic remains same, but use pinned memory for db_encoder_out) ...
+
+    // 1. Asynchronous Host-to-Device Copy [cite: 606]
+    cudaMemcpyAsync(d_db, db_encoder_out, db_nBytes,
+                    cudaMemcpyHostToDevice, streams[sIdx]);
+
+    // 2. Kernel Launch in a specific stream [cite: 687]
+    // The 4th parameter in <<<...>>> is the stream ID
+    blast<<<blocksPerGrid, threadsPerBlock, shmemBytes, streams[sIdx]>>>(params);
+
+    // 3. Asynchronous Device-to-Host Copy [cite: 607, 613]
+    // Copy the hit count back so we can process it later
+    cudaMemcpyAsync(&h_hitCounts[si-1], d_hitCount, sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost, streams[sIdx]);
+}
+
+// Wait for all 4 streams to finish before saving files
+CHECK_CUDA(cudaDeviceSynchronize());
