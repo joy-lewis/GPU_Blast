@@ -297,12 +297,12 @@ __device__ __forceinline__  uint32_t kmer_at_msb_bytes_device(const uint8_t* enc
 }
 
 
-// Shared-tile accessor with global fallback
+// Defines struct for a database sequence tile
 struct Tile{
-    const uint8_t* db_global;
-    const uint8_t* tile_shared;  // packed bytes for tile
-    uint32_t startChar;      // start char index in global db
-    uint32_t nChars;          // number of valid chars in tile
+    const uint8_t* db_global;    // pointer to the original database sequence
+    const uint8_t* tile_shared;  // tile of db sequence which is to live in shared memory
+    uint32_t startChar;          // start char index in global db
+    uint32_t nChars;             // number of valid chars in tile
 };
 
 __device__ __forceinline__ uint32_t tile_char_at(const Tile& acc, uint32_t dbCharIdx)
