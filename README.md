@@ -40,5 +40,17 @@ Function [`build_lookup_table_from_encoded()`](gpu_blast.cu) builds the lookup t
 This lookup table is necessary for the threads to know if their seed k-mer has a match in the query sequence and 
 at what positon that matching k-mer sits at. This saves a lot of time since the same k-mers are looked up very frequently.
 
+## BLAST DNA Sequence Alignment
+
+In [`ungapped_extend()`](gpu_blast.cu) and [`blast()`](gpu_blast.cu) we implemented the BLAST algorithm. For details refer to the comments 
+in the code. Here is an overview of how the algorithm functions:
+
+//todo: insert pseudocode
+
+## Optimisation
+
+//todo: aspects from poster + other attempts that failed
+
+
 
 

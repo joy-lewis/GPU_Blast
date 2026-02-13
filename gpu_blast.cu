@@ -268,7 +268,7 @@ LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offset
 
 
 ///////////
-/////////// BLAST DNA Alignment
+/////////// Helper Functions
 ///////////
 
 __device__ __forceinline__ uint32_t base_at_msb_device(const uint8_t* encoded_dna, uint32_t i) {
@@ -296,96 +296,103 @@ __device__ __forceinline__  uint32_t kmer_at_msb_bytes_device(const uint8_t* enc
     return key;
 }
 
-
 // Defines struct for a database sequence tile
 struct Tile{
     const uint8_t* db_global;    // pointer to the original database sequence
-    const uint8_t* tile_shared;  // tile of db sequence which is to live in shared memory
+    const uint8_t* tile_shared;  // tile of db sequence which later lives in shared memory
     uint32_t startChar;          // start char index in global db
-    uint32_t nChars;             // number of valid chars in tile
+    uint32_t nChars;             // number of chars in tile
 };
 
-__device__ __forceinline__ uint32_t tile_char_at(const Tile& acc, uint32_t dbCharIdx)
-{
-    // If inside tile, access shared; else access global
-    if (dbCharIdx >= acc.startChar && dbCharIdx < (acc.startChar + acc.nChars)) {
-        uint32_t local = dbCharIdx - acc.startChar;
+__device__ __forceinline__ uint32_t tile_char_at(const Tile& acc, uint32_t db_char_idx){
+    // To access a specific DNA base in a tile
+
+    if (db_char_idx >= acc.startChar && db_char_idx < (acc.startChar + acc.nChars)) {
+        uint32_t local = db_char_idx - acc.startChar;
         return base_at_msb_device(acc.tile_shared, local);
     } else {
-        return base_at_msb_device(acc.db_global, dbCharIdx);
+        return base_at_msb_device(acc.db_global, db_char_idx);
     }
 }
 
 
-// Simple ungapped extension around a seed
+///////////
+/////////// BLAST DNA Alignment - Extension mechanism
+///////////
 __device__ __forceinline__ void ungapped_extend(
-    const uint8_t* q_shared,
-    const Tile& dbAcc,
-    uint32_t qLenChars,
-    uint32_t dbLenChars,
-    uint32_t qSeedPos,
-    uint32_t dbSeedPos,
-    int32_t& outBestScore,
-    int32_t& outLeftExt,
-    int32_t& outRightExt){
+    const uint8_t* q_shared, // query sequence from shared memory
+    const Tile& db_tile,  // tile sequence from shared memory
+    uint32_t q_len_chars,  // query length (in characters)
+    uint32_t db_len_chars,  // full database sequence length (in characters)
+    uint32_t db_seed_pos,  // db k-mer seed position
+    uint32_t q_seed_pos,  // matching query k-mer position
+    int32_t& out_best_score,  // the alignment score
+    int32_t& out_left_extension,  // length (in characters) of the extension to the left from seed
+    int32_t& out_right_extension){ // length of the extension to the right of the seed
+    // Regular ungapped extension to the left and right of a k-mer seed
 
-    // Seed is exact match by construction
-    int32_t score = (int32_t)K * MATCH_SCORE;
+    int32_t score = (int32_t)K * MATCH_SCORE; // the starting score is the seed itself
     int32_t best  = score;
 
     int32_t bestLeft  = 0;
     int32_t bestRight = 0;
 
-    // Left extension
-    int32_t cur = score;
+    //// Left extension
+    int32_t curr_score = score;
     int32_t leftExt = 0;
-    int32_t iQ  = (int32_t)qSeedPos - 1;
-    int32_t iDB = (int32_t)dbSeedPos - 1;
-    while (iQ >= 0 && iDB >= 0) {
+    int32_t iQ  = (int32_t)q_seed_pos - 1;
+    int32_t iDB = (int32_t)db_seed_pos - 1;
+    while (iQ >= 0 && iDB >= 0) { // while there are more DNA bases to the left of the current extension
         const uint32_t qb  = base_at_msb_device(q_shared, (uint32_t)iQ);
-        const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
-        cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
-        leftExt++;
+        const uint32_t db_base = tile_char_at(db_tile, (uint32_t)iDB);
+        curr_score += (qb == db_base) ? MATCH_SCORE : MISMATCH_PENALTY; // score the current alignment
+        leftExt++;  // record length
 
-        if (cur > best) {
-            best = cur;
+        if (curr_score > best) {  // if we found a new best score, save it
+            best = curr_score;
             bestLeft = leftExt;
         }
-        if (cur < best - X_DROP) break;
-        --iQ; --iDB;
+        if (curr_score < best - X_DROP) { // early exit an extension if the current score dropped to far bellow the best one
+            break;
+        }
+        --iQ; --iDB; // step to the left
     }
 
-    // Right extension
-    cur = best; // we continue from best-so-far of previous left extension
+    //// Right extension (same as left extension but mirrored to the right)
+    curr_score = best;
     int32_t rightExt = 0;
-    iQ  = (int32_t)(qSeedPos + K);
-    iDB = (int32_t)(dbSeedPos + K);
-    while (iQ < (int32_t)qLenChars && iDB < (int32_t)dbLenChars) {
+    iQ  = (int32_t)(q_seed_pos + K); // we need to jump over the current seed first
+    iDB = (int32_t)(db_seed_pos + K);
+    while (iQ < (int32_t)q_len_chars && iDB < (int32_t)db_len_chars) {
         const uint32_t qb  = base_at_msb_device(q_shared, (uint32_t)iQ);
-        const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
-        cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
+        const uint32_t db_base = tile_char_at(db_tile, (uint32_t)iDB);
+        curr_score += (qb == db_base) ? MATCH_SCORE : MISMATCH_PENALTY;
         rightExt++;
 
-        if (cur > best) {
-            best = cur;
+        if (curr_score > best) {
+            best = curr_score;
             bestRight = rightExt;
         }
-        if (cur < best - X_DROP) break;
-
+        if (curr_score < best - X_DROP) {
+            break;
+        }
         ++iQ; ++iDB;
     }
 
-    outBestScore = best;
-    outLeftExt   = bestLeft;
-    outRightExt  = bestRight;
+    out_best_score = best;
+    out_left_extension = bestLeft;
+    out_right_extension = bestRight;
 }
 
 
-// Main BLAST kernel who is responsible for the tiling process
-__global__ void blast(KernelParamsView params)
-{
+///////////
+/////////// BLAST DNA Alignment - Main BLAST Kernel
+///////////
+__global__ void blast(KernelParamsView params){
     // To not exceed our thread budget
-    if (blockDim.x != NUM_THREADS_PER_BLOCK) return;
+    if (blockDim.x != NUM_THREADS_PER_BLOCK) {
+        return;
+    }
 
     const uint32_t qLen = params.query.nChars;
     const uint32_t dbLen = params.database.nChars;
@@ -480,7 +487,7 @@ __global__ void blast(KernelParamsView params)
                 if (qPos + K > qLen) continue; // to avoid out of bounds errors
 
                 int32_t bestScore, leftExt, rightExt;
-                ungapped_extend(q_sh, dbAcc, qLen, dbLen, qPos, dbPos,
+                ungapped_extend(q_sh, dbAcc, qLen, dbLen, dbPos,qPos,
                                 bestScore, leftExt, rightExt);
 
                 if (bestScore >= MIN_REPORT_SCORE) {
@@ -522,7 +529,10 @@ __global__ void blast(KernelParamsView params)
 }
 
 
-// Updated to accept host pointers instead of device pointers
+///////////
+/////////// Saving alignment results in NCBI style
+///////////
+
 void save_results(uint32_t hitCount, uint32_t maxHits, const Hit* h_hits_src, int si) {
     // 4) hitCount is already passed as a value from host pinned memory
     // No cudaMemcpy needed here!
@@ -571,14 +581,10 @@ void save_results(uint32_t hitCount, uint32_t maxHits, const Hit* h_hits_src, in
 }
 
 
-////////////////////////////
-////////// MAIN FUNCTION //
-///////////////////////////
-
-/// 3-way concurrent loop
-///
-///
-///
+///////////
+/////////// Main function launching the algorithm and
+/////////// performing a 3-way concurrency loop
+///////////
 
 int blast_main() {
     // 1. Hardware Discovery (Do this once)
