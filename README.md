@@ -1,9 +1,8 @@
 # GPU_Blast
 GPU accelerated BLAST algorithm for DNA-sequence alignment.
 
-### Hyperparameters
-The algorithm hyperparameters are (there are more but we only describe the most important ones)
-
+### Algorithm Hyperparameters
+The algorithm hyperparameters are (there are more but we only describe the most important ones):
 ```ccp
 DB_SIZE: 10  
 K: 12
@@ -20,10 +19,26 @@ we also have significantly more tiles than available blocks which makes the for 
 Unlike for protein alignment where we have more complex structures, DNA only has 4 bases so a scoring of +1 for DNA base matches and -1 for
 non-matches is sufficient during the extension process.
 
+### Launch Configuration Parameters
 Our launch configuration is as follows:
-- NUM_THREADS_PER_BLOCK: 128
-- NUM_BLOCKS_PER_SM: 8
+```ccp
+NUM_THREADS_PER_BLOCK: 128
+NUM_BLOCKS_PER_SM: 8
+```
 
-### File extraction
-The [read_fasta()](gpu_blast.cu) function gets the raw NCBI data and parses the sequences into regular c++ char vectors 
+### Extract DNA sequences from fasta files
+The [`read_fasta()`](gpu_blast.cu) function gets the raw NCBI data and parses the sequences into regular c++ char vectors 
 to prepare them for the bit compression.
+
+### Data Compression
+In [`encoder()`](gpu_blast.cu) we drastically compress the DNA sequence data because DNA only consists of 4 unique characters (bases) which is why a 2 bit encoding is sufficient
+to represent each base, instead of the larger ASCII encoding. Before we start the data transfer to the device we therefore compress all of our data in this manner.
+[`decoder()`](gpu_blast.cu) decompresses those bit-encodings again for our test functions.
+
+### Lookup Table
+Function [`build_lookup_table_from_encoded()`](gpu_blast.cu) builds the lookup table for the short query sequence. 
+This lookup table is necessary for the threads to know if their seed k-mer has a match in the query sequence and 
+at what positon that matching k-mer sits at. This saves a lot of time since the same k-mers are looked up very frequently.
+
+
+

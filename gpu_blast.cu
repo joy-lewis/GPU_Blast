@@ -19,7 +19,6 @@
 ///////////
 /////////// Define Algorithm Hyperparameters
 ///////////
-
 #define DB_SIZE 10   // number of sequences in Database
 #define K 12   // defines k-mer length // conditions: K>0
 #define MAX_LOCAL_HITS 256   // maximum number of hits that fit into the local hit buffer within the shared memory of a block
@@ -34,7 +33,6 @@
 ///////////
 /////////// Define Launch Configuration Parameters
 ///////////
-
 #define NUM_THREADS_PER_BLOCK 128
 #define NUM_BLOCKS_PER_SM 8
 
@@ -42,7 +40,6 @@
 ///////////
 /////////// Sanity checks
 ///////////
-
 #define CHECK_CUDA(call)                                            \
     {                                                               \
         cudaError_t err = (call);                                   \
@@ -58,7 +55,6 @@
 ///////////
 /////////// Extract DNA sequences from fasta files
 ///////////
-
 std::vector<char> read_fasta(const std::string& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("Failed to open: " + path);
@@ -66,25 +62,26 @@ std::vector<char> read_fasta(const std::string& path) {
     std::vector<char> seq;
     std::string line;
 
-    int nBytes = 0;
-    int nChars = 0;
-
     while (std::getline(in, line)) {
-        if (!line.empty() && line[0] == '>') continue; // skip header
-        for (unsigned char ch : line) {
-            if (std::isspace(ch)) continue;
+        if (!line.empty() && line[0] == '>') { // skip header
+            continue;
+        }
+        for (unsigned char ch : line) { // parse line by line
+            if (std::isspace(ch)) {
+                continue;
+            }
             ch = (unsigned char)std::toupper(ch);
-            if (ch=='A' || ch=='C' || ch=='G' || ch=='T')
+            if (ch=='A' || ch=='C' || ch=='G' || ch=='T') { // all 4 possible DNA bases
                 seq.push_back((char)ch);
+            }
         }
     }
     return seq;
 }
 
-
-/////////////////////////////////
-///////////// Data Compression //
-/////////////////////////////////
+///////////
+/////////// Data Compression
+///////////
 uint8_t encode_char(char c) {
     // Compressing the ASCII characters (4 unique DNA bases) to a 2-bit encoding
     switch (c) {
@@ -109,16 +106,22 @@ char decode_bits(uint8_t b) {
     return 0;
 }
 
-// Converting DNA sequence to bit array
-// Layout for 8-bit array: base 0 is in bits 7–6 of byte 0, base 1 in bits 5–4, base 2 in bits 3–2, base 3 in bits 1–0
-void encoder(const std::vector<char>& input, size_t length, uint8_t* output) {
+
+void encoder(const std::vector<char>&input, size_t length, uint8_t* output) {
+    // Converting DNA sequence to bit array
+    // Layout for a 4 base word in an 8-bit encoding:
+    //      base 0 is in bits 7–6,
+    //      base 1 in bits 5–4,
+    //      base 2 in bits 3–2,
+    //      base 3 in bits 1–0
+
     size_t in_index = 0;
     size_t out_index = 0;
 
     while (in_index < length) {
         uint8_t new_byte = 0;
 
-        // pack 4 bases into 1 byte, MSB-first
+        // Store 4 bases into 1 byte, in the manner of MSB-first, i.e. left shift byte to make room for next DNA base
         for (int i = 0; i < 4; i++) {
             new_byte <<= 2;
             if (in_index < length) {
@@ -131,8 +134,10 @@ void encoder(const std::vector<char>& input, size_t length, uint8_t* output) {
     }
 }
 
-// Converting but string to DNA sequence
-void decoder(const uint8_t* input, size_t length, char* output) { //length==number of characters that are encoded in the input bits (relevant because last byte might encode less then 4 characters)
+
+void decoder(const uint8_t* input, size_t length, char* output) { //length == Number of characters that are encoded in the input bits (relevant because last byte might encode less than 4 characters)
+    // Revert the compression from 2-bit back to ASCII characters
+
     int in_index = 0;
     int out_index = 0;
 
@@ -141,13 +146,13 @@ void decoder(const uint8_t* input, size_t length, char* output) { //length==numb
 
         // Encode the next 4 characters
         for (int shift = 6; shift >= 0; shift -=2) {
-            // we right shift by 6, 4, 2 and then 0 to have each bit pair at the rightmost edge of the byte
+            // We right shift by 6, 4, 2 and then 0 to have each bit pair at the rightmost edge of the byte
             // then we do AND with 0b11 to isolate the two rightmost bits we care about
-            uint8_t sbyte = byte>>shift;
-            sbyte = sbyte&0b11;
+            uint8_t s_byte = byte>>shift;
+            s_byte = s_byte&0b11;
 
             if (out_index < length) {
-                uint8_t decoding = decode_bits(sbyte);
+                uint8_t decoding = decode_bits(s_byte);
                 output[out_index++] = decoding;
             }
         }
@@ -156,76 +161,68 @@ void decoder(const uint8_t* input, size_t length, char* output) { //length==numb
 }
 
 
-///////////////////////////////////
-////////// Lookup Table Creation //
-///////////////////////////////////
-///
-//logic:
-// “indices 100..143 belong to k-mer 0x11111”
-// “indices 144..146 belong to k-mer 0x22222”
+///////////
+/////////// Lookup Table Creation
+///////////
 
-// "offsets[k-mer] = start index in positions[]"
-// "offsets[k-mer+1] = end index in positions[]"
+// Here is an example describing the logic that this query lookup table is build on:
+// indices 0...43 belong to k-mer i at 0x11111
+// indices 44...46 belong to k-mer j at 0x22222
+
+// offsets[k-mer i] == start index in positions array for k-mer i
+// offsets[k-mer i+1] == end index in positions array for k-mer i
 
 // "positions array are sorted query sequence positions"
 
 // all possible k-mers are within [0, 2^(2*K)], because every character is 2 bits long (2*K) and there are 2 possible bits
 // simplifies to [0, 4^K]
 
-uint32_t base_at_msb4(const uint8_t* encoded_dna, uint32_t i)
-{
-    //Purpose of this function:
-    // 1.	Which byte contains base i
-    // 2.	Where inside that byte the 2 bits for that base live
-    // 3.	Shift + mask to extract those 2 bits
-    const uint32_t byte_idx = i >> 2;           // i / 4
-    const uint32_t in_byte  = i & 3u;           // 0..3
-    const uint32_t shift    = 6u - 2u * in_byte; // 6,4,2,0 (MSB -> LSB)
-    return (encoded_dna[byte_idx] >> shift) & 0x3u;
+uint32_t base_at_msb(const uint8_t* encoded_dna, uint32_t i) {
+    // This function extracts the two bits of the i-th DNA base from an 8-bit (byte) compression
+
+    const uint32_t byte_idx = i >> 2;                // identify which byte in the encoded_dna array contains the i-th DNA base
+    const uint32_t in_byte  = i & 3u;                // computes the DNA bases`s positon within the byte
+    const uint32_t shift    = 6u - 2u * in_byte;     // 6,4,2,0 (MSB -> LSB), i.e. we shift the bit pair we are interested in to the right most positon
+    return (encoded_dna[byte_idx] >> shift) & 0x3u;  // masking with 0x3u to extract the bit pair
 }
 
-// Returns a 2k-bit key where the leftmost base is the most significant 2 bits.
-// Example: ACGT => 00 01 10 11 => 0b00011011
-uint32_t kmer_at_msb_bytes(const uint8_t* encoded_dna,
-                                         uint32_t pos, uint32_t k)
-{
+uint32_t kmer_at_msb_bytes(const uint8_t* encoded_dna, uint32_t pos, uint32_t k) {
+    // Returns a 2k-bit key where the leftmost base gets the most significant 2 bits in the encoding
+    // Example: ACGT => 00 01 10 11 => 0b00011011
+
     uint32_t key = 0;
     for (uint32_t j = 0; j < k; ++j) {
-        key = (key << 2) | base_at_msb4(encoded_dna, pos + j);
+        key = (key << 2) | base_at_msb(encoded_dna, pos + j);   // build the key from left to right
     }
     return key;
 }
 
 
-LookupTable build_lookup_table_from_encoded(
-    const uint8_t* encoded_dna,  // packed 2-bit characters (4 per byte, MSB-first)
-    uint32_t N,                  // total number of characters in the query
-    uint32_t k                   // k-mer length in characters
-){
+LookupTable build_lookup_table_from_encoded(const uint8_t* encoded_dna, uint32_t N, uint32_t k){
+    // Builds the lookup table from the encoding `encoded_dna` for k-mer size K and a query sequence of length N
 
-    if (2u * k >= 32u) {
-        // because we store keys in uint32_t and compute M = 1<<(2k)
+    if (k > 16) { // Sanity check for k. We can only fit k*2 bits in the keys of the lookup table
         throw std::invalid_argument("k too large for 32-bit key / table size");
     }
 
     const uint32_t L = N - k + 1u;      // number of k-mers in query
     const uint32_t M = 1u << (2u * k);  // number of possible k-mers (4^k)
 
-    // 1) count occurrences
+    // 1) Count occurrences per k-mer
     std::vector<uint32_t> counts(M, 0);
     for (uint32_t i = 0; i < L; ++i) {
         const uint32_t key = kmer_at_msb_bytes(encoded_dna, i, k);
         ++counts[key];
     }
 
-    // 2) prefix sum -> offsets (exclusive scan)
+    // 2) Sum up the k-mer offset position with the hits to get the range of positons for this k-mer (as described in the example)
     std::vector<uint32_t> offsets(M + 1u, 0);
     for (uint32_t key = 0; key < M; ++key) {
         offsets[key + 1u] = offsets[key] + counts[key];
     }
 
-    // 3) fill positions (sorted per key because i increases)
-    std::vector<uint32_t> cursor(offsets.begin(), offsets.begin() + M); // size M
+    // 3) Fill positions (sorted per k-mer key because i increases)
+    std::vector<uint32_t> cursor(offsets.begin(), offsets.begin() + M); // the end is the number of all possible k-mers
     std::vector<uint32_t> positions(L);
 
     for (uint32_t i = 0; i < L; ++i) {
@@ -238,8 +235,10 @@ LookupTable build_lookup_table_from_encoded(
 }
 
 
-// Handles memory allocation on device and copies the lookup table contents over to the device
 LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offsets_out, uint32_t** d_positions_out) {
+    // Handles memory allocation on device and copies the lookup table contents over to the device
+
+    // Allocating memory for the offsets and positions is enough, the rest of the struct are only single numbers
     uint32_t* d_offsets;
     uint32_t* d_positions;
 
@@ -254,7 +253,8 @@ LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offset
                           t.positions.size() * sizeof(uint32_t),
                           cudaMemcpyHostToDevice));
 
-    // returns device pointers
+    // Save the pointers to the allocated memory to the lookup table struct
+    // so we can hand it over to the kernel function later
     *d_offsets_out = d_offsets;
     *d_positions_out = d_positions;
 
@@ -267,28 +267,31 @@ LookupTableView lookup_table_to_device(const LookupTable& t, uint32_t** d_offset
 }
 
 
-////////////////////////////
-////////// DNA Alignment //
-///////////////////////////
+///////////
+/////////// BLAST DNA Alignment
+///////////
 
+__device__ __forceinline__ uint32_t base_at_msb_device(const uint8_t* encoded_dna, uint32_t i) {
+    // *Same as above but only to be called from within the kernel*
 
-// leftmost 2-bit character (DNA base) extraction
-// Similar logic to what we used for the lookup table creation
-__device__ __forceinline__ uint32_t base_at_msb4_dev(const uint8_t* encoded_dna, uint32_t iChar) {
-    const uint32_t byte_idx = iChar >> 2;            // /4
-    const uint32_t in_byte  = iChar & 3u;            // 0..3
-    const uint32_t shift    = 6u - 2u * in_byte;     // 6,4,2,0
-    return (encoded_dna[byte_idx] >> shift) & 0x3u;
+    // This function extracts the two bits of the i-th DNA base from an 8-bit (byte) compression
+
+    const uint32_t byte_idx = i >> 2;                // identify which byte in the encoded_dna array contains the i-th DNA base
+    const uint32_t in_byte  = i & 3u;                // computes the DNA bases`s positon within the byte
+    const uint32_t shift    = 6u - 2u * in_byte;     // 6,4,2,0 (MSB -> LSB), i.e. we shift the bit pair we are interested in to the right most positon
+    return (encoded_dna[byte_idx] >> shift) & 0x3u;  // masking with 0x3u to extract the bit pair
 }
 
-// k-mer extraction
-__device__ __forceinline__ uint32_t kmer_at_msb_bytes_dev(const uint8_t* encoded_dna,
-                                                          uint32_t posChar) {
+
+__device__ __forceinline__  uint32_t kmer_at_msb_bytes_device(const uint8_t* encoded_dna, uint32_t pos, uint32_t k) {
+    // *Same as above but only to be called from within the kernel*
+
+    // Returns a 2k-bit key where the leftmost base gets the most significant 2 bits in the encoding
+    // Example: ACGT => 00 01 10 11 => 0b00011011
+
     uint32_t key = 0;
-    #pragma unroll
-    for (uint32_t j = 0; j < 32; ++j) {  // unroll upper bound; break at K
-        if (j >= K) break;
-        key = (key << 2) | base_at_msb4_dev(encoded_dna, posChar + j);
+    for (uint32_t j = 0; j < k; ++j) {
+        key = (key << 2) | base_at_msb_device(encoded_dna, pos + j);   // build the key from left to right
     }
     return key;
 }
@@ -307,9 +310,9 @@ __device__ __forceinline__ uint32_t tile_char_at(const Tile& acc, uint32_t dbCha
     // If inside tile, access shared; else access global
     if (dbCharIdx >= acc.startChar && dbCharIdx < (acc.startChar + acc.nChars)) {
         uint32_t local = dbCharIdx - acc.startChar;
-        return base_at_msb4_dev(acc.tile_shared, local);
+        return base_at_msb_device(acc.tile_shared, local);
     } else {
-        return base_at_msb4_dev(acc.db_global, dbCharIdx);
+        return base_at_msb_device(acc.db_global, dbCharIdx);
     }
 }
 
@@ -339,7 +342,7 @@ __device__ __forceinline__ void ungapped_extend(
     int32_t iQ  = (int32_t)qSeedPos - 1;
     int32_t iDB = (int32_t)dbSeedPos - 1;
     while (iQ >= 0 && iDB >= 0) {
-        const uint32_t qb  = base_at_msb4_dev(q_shared, (uint32_t)iQ);
+        const uint32_t qb  = base_at_msb_device(q_shared, (uint32_t)iQ);
         const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
         cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
         leftExt++;
@@ -358,7 +361,7 @@ __device__ __forceinline__ void ungapped_extend(
     iQ  = (int32_t)(qSeedPos + K);
     iDB = (int32_t)(dbSeedPos + K);
     while (iQ < (int32_t)qLenChars && iDB < (int32_t)dbLenChars) {
-        const uint32_t qb  = base_at_msb4_dev(q_shared, (uint32_t)iQ);
+        const uint32_t qb  = base_at_msb_device(q_shared, (uint32_t)iQ);
         const uint32_t dbb = tile_char_at(dbAcc, (uint32_t)iDB);
         cur += (qb == dbb) ? MATCH_SCORE : MISMATCH_PENALTY;
         rightExt++;
