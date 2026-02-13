@@ -398,133 +398,137 @@ __global__ void blast(KernelParamsView params){
     const uint32_t dbLen = params.database.nChars;
     const uint32_t qBytes = params.query.nBytes;
 
-    // Shared memory layout:
-    // [ query_bytes ][ tile_bytes ]
+    // Shared memory layout: [ query_bytes ][ tile_bytes ]
     extern __shared__ uint8_t shared_mem[];
 
-    // 1. Declare Privatized Shared Variables [cite: 83, 151]
-    __shared__ uint32_t blockHitCount;
-    __shared__ uint32_t globalBaseIdx;
-    __shared__ Hit localHitBuffer[MAX_LOCAL_HITS];
+    // 1) Declare shared memory variables for the private hit counter
+    __shared__ uint32_t block_hit_count;
+    __shared__ uint32_t global_base_idx;
+    __shared__ Hit local_hit_buffer[MAX_LOCAL_HITS];
 
-    // Round qBytes up to the nearest multiple of 4 to ensure the NEXT pointer is aligned
-    const uint32_t qBytesAligned = (params.query.nBytes + 3) & ~0x03;
+    // Round qBytes up to the nearest multiple of 4 to ensure the NEXT pointer is 4-byte aligned
+    // which is a good property as discussed in the lecture
+    const uint32_t q_bytes_aligned = (params.query.nBytes + 3) & ~0x03;
     uint8_t* q_sh = shared_mem;
-    uint8_t* tile_sh = q_sh + qBytesAligned; // tile_sh is now guaranteed 4-byte aligned
+    uint8_t* tile_sh = q_sh + q_bytes_aligned; // tile_sh is now guaranteed 4-byte aligned
 
-    // 1) Load query into shared (all blocks do this in parallel)
+    // 2) Use all threads in all blocks to load query into shared memory
     for (uint32_t i = threadIdx.x; i < qBytes; i += blockDim.x) {
         q_sh[i] = params.query.seq[i];
     }
     __syncthreads(); // wait till the full query is loaded into shared memory
 
-    // 2) Every block has its pre-determined set of tiles: tileId = blockIdx.x
-    //  which gets updated in each iteration with tileId = tileId + gridDim.x
+    // 3) Every block has its pre-determined set of tiles. The start is tileId = blockIdx.x
+    //    which gets updated in each iteration with tileId = tileId + gridDim.x
+    //    This is the tile-stride logic we described in the pseudocode
     const uint32_t tilesTotal = (dbLen + TILE_CHARS - 1u) / TILE_CHARS;
 
-    // incrementing the tileId by the grid dimension X ensures that we only process a DB tile sequence only once
-    // -> this implements the tile-stride logic
+    // Now we are iterating over the assigned tiles (as described above)
     for (uint32_t tileId = (uint32_t) blockIdx.x; tileId < tilesTotal; tileId += (uint32_t) gridDim.x) {
-
-        // Reset local counter for the new tile
-        if (threadIdx.x == 0) blockHitCount = 0;
-        __syncthreads();
-
-        const uint32_t tileStartChar = tileId * TILE_CHARS;
-        const uint32_t tileChars = min(TILE_CHARS, dbLen - tileStartChar);
-        const uint32_t tileBytes = (tileChars + 3u) >> 2;
-        const uint32_t tileStartByte = tileStartChar >> 2;
-
-        // 2a) loading this tile’s encoded bytes into shared memory using vectorized loads
-        // This addresses the "UncoalescedGlobalAccess" bottleneck in your Nsight profile.
-        // each thread loads 4 bytes (16 DNA bases) which ensures that adjacent threads load adjacent memory
-        uint32_t* tile_sh_32 = (uint32_t*)tile_sh;
-        uint32_t* db_global_32 = (uint32_t*)&params.database.seq[tileStartByte];
-
-        // we divide tileBytes by 4 because each thread now loads 4 bytes (32 bits, 16 DNA bases) at once
-        // -> this implements the k-mer stride logic within a tile
-        for (uint32_t i = threadIdx.x; i < (tileBytes + 3) / 4; i += blockDim.x) {
-            tile_sh_32[i] = db_global_32[i]; // Coalesced 32-bit load
+        // Reset local hit counter for the new tile
+        if (threadIdx.x == 0) {
+            block_hit_count = 0;
         }
-        __syncthreads(); // Wait until the entire tile is loaded into shared memory
+        __syncthreads(); // counter has to be set to zero before we can start new alignments
+
+        // here we store the global position of the current tile and identify the starting byte
+        const uint32_t tile_start_char = tileId * TILE_CHARS;
+        const uint32_t tile_chars = min(TILE_CHARS, dbLen - tile_start_char);
+        const uint32_t tile_bytes = (tile_chars + 3u) >> 2;
+        const uint32_t tile_start_byte = tile_start_char >> 2;
+
+        // 4) Loading this tiles encoded bytes into shared memory.
+        //    Each thread loads 4 bytes (16 DNA bases) which ensures that adjacent threads load adjacent memory
+        uint32_t* tile_sh_32 = (uint32_t*) tile_sh;
+        uint32_t* db_global_32 = (uint32_t*) &params.database.seq[tile_start_byte];
+
+        // We divide tileBytes by 4 because each thread now loads 4 bytes (32 bits, 16 DNA bases) at once
+        // -> this implements the thread-level k-mer stride logic within a tile
+        for (uint32_t i = threadIdx.x; i < (tile_bytes + 3) / 4; i += blockDim.x) {
+            tile_sh_32[i] = db_global_32[i]; // coalesced 32-bit load
+        }
+        __syncthreads(); // wait until the entire tile is loaded into shared memory
 
         // Define current tile
-        Tile dbAcc;
-        dbAcc.db_global = params.database.seq;
-        dbAcc.tile_shared = tile_sh;
-        dbAcc.startChar = tileStartChar;
-        dbAcc.nChars = tileChars;
+        Tile db_tile;
+        db_tile.db_global = params.database.seq;
+        db_tile.tile_shared = tile_sh;
+        db_tile.startChar = tile_start_char;
+        db_tile.nChars = tile_chars;
 
-        // 3) Each thread processes start positions in this tile: start = tileStartChar + tid
-        // then += blockDim.x (i.e. each thread pulls its next seed with a offset of NUM_THREADS_PER_BLOCK)
-        for (uint32_t dbPos = tileStartChar + (uint32_t) threadIdx.x;
-             dbPos < tileStartChar + tileChars;
-             dbPos += (uint32_t) blockDim.x) {
-            // sanity checks
-            if (dbPos + K > dbLen) continue;
-            if (K == 0 || qLen < K) continue;
-
-            // Build k-mer key from database sequence at dbPos.
-            // Uses shared tile for speed when inside tile; but kmer_at expects a pointer.
-            // So we compute by reading character-by-character via tile_char_at().
-            uint32_t key = 0;
-            //#pragma unroll
-            for (uint32_t j = 0; j < 32; ++j) {
-                if (j >= K) break;
-                key = (key << 2) | tile_char_at(dbAcc, dbPos + j);
+        // 5) Each thread processes start positions in the tile in this manner: start = tile_start_char + tid
+        //    then += blockDim.x (i.e. each thread pulls its next seed with an offset of NUM_THREADS_PER_BLOCK)
+        for (uint32_t dbPos = tile_start_char + (uint32_t) threadIdx.x; dbPos < tile_start_char + tile_chars; dbPos += (uint32_t) blockDim.x) {
+            // sanity checks (out of bounds or invalid query)
+            if ((dbPos + K > dbLen) || (K == 0 || qLen < K)){
+                continue;
             }
 
-            // Finding matches for this k-mer in query lookup table
-            if (key + 1u >= params.lView.nOffsets) continue; // to avoid out of bounds errors
+            // Builds k-mer key from database sequence at dbPos, using the current tile
+            uint32_t key = 0;
+            for (uint32_t j = 0; j < 32; ++j) {
+                if (j >= K) break;
+                key = (key << 2) | tile_char_at(db_tile, dbPos + j);
+            }
+
+            // Finds matches for this k-mer in query lookup table
+            if (key + 1u >= params.lView.nOffsets) { // Sanity check, to avoid out of bounds errors
+                continue;
+            }
+
+            // Indices to pull all query positions at which there is a match for the current k-mer key
             const uint32_t start = params.lView.offsets[key];
             const uint32_t end   = params.lView.offsets[key + 1u];
 
-            // We perform an extension for each match position in query
+            // We perform an extension for each matched position in query
             for (uint32_t idx = start; idx < end; ++idx) {
                 if (idx >= params.lView.nPositions) break;
                 const uint32_t qPos = params.lView.positions[idx];
 
-                if (qPos + K > qLen) continue; // to avoid out of bounds errors
+                if (qPos + K > qLen) { // Sanity check, to avoid out of bounds errors
+                    continue;
+                }
 
+                // Run left and right extensions
                 int32_t bestScore, leftExt, rightExt;
-                ungapped_extend(q_sh, dbAcc, qLen, dbLen, dbPos,qPos,
+                ungapped_extend(q_sh, db_tile, qLen, dbLen, dbPos,qPos,
                                 bestScore, leftExt, rightExt);
 
-                if (bestScore >= MIN_REPORT_SCORE) {
-                    // 1. Privatized Atomic: Add to shared memory counter [cite: 26, 34]
-                    uint32_t localIdx = atomicAdd(&blockHitCount, 1u);
+                if (bestScore >= MIN_REPORT_SCORE) { // only significant alignments are saved
+                    // privatized atomic add to hit counter in shared memory
+                    uint32_t localIdx = atomicAdd(&block_hit_count, 1u);
 
-                    // 2. Staging: Store hit in shared memory buffer [cite: 151, 155]
-                    if (localIdx < MAX_LOCAL_HITS) {
+                    // stores hit in buffer in shared memory
+                    if (localIdx < MAX_LOCAL_HITS) { // to avoid out of memory error
                         Hit h;
                         h.db_pos = dbPos;
                         h.q_pos = qPos;
                         h.bestScore = bestScore;
                         h.leftExt = leftExt;
                         h.rightExt = rightExt;
-                        localHitBuffer[localIdx] = h;
+                        local_hit_buffer[localIdx] = h;
                     }
                 }
             }
         }
 
-        // 2. COMMIT THE TILE RESULTS ONCE
-        __syncthreads(); // Wait for all threads to finish the ENTIRE tile [cite: 141, 158]
+        // 6) Ony one thread in this block register the alignment results of the whole block once
+        __syncthreads(); // wait for all threads to finish their alignment jobs on the entire tile
 
-        if (threadIdx.x == 0 && blockHitCount > 0) {
-            uint32_t numToCopy = min(blockHitCount, (uint32_t)MAX_LOCAL_HITS);
-            globalBaseIdx = atomicAdd(params.hitCount, numToCopy); // Single global atomic per tile [cite: 45]
+        if (threadIdx.x == 0 && block_hit_count > 0) {
+            uint32_t numToCopy = min(block_hit_count, (uint32_t)MAX_LOCAL_HITS);
+            global_base_idx = atomicAdd(params.hitCount, numToCopy);
         }
         __syncthreads();
 
-        // 3. COALESCED WRITE TO GLOBAL
-        uint32_t numToCopy = min(blockHitCount, (uint32_t)MAX_LOCAL_HITS);
+        // 7) Writing results back to global memory
+        uint32_t numToCopy = min(block_hit_count, (uint32_t)MAX_LOCAL_HITS);
         for (uint32_t i = threadIdx.x; i < numToCopy; i += blockDim.x) {
-            if (globalBaseIdx + i < params.maxHits) {
-                params.hits[globalBaseIdx + i] = localHitBuffer[i]; // Coalesced access [cite: 112, 119]
+            if (global_base_idx + i < params.maxHits) {
+                params.hits[global_base_idx + i] = local_hit_buffer[i];
             }
         }
-        __syncthreads();
+        __syncthreads(); // wait till all results have been updated in global memory
     }
 }
 
@@ -534,19 +538,15 @@ __global__ void blast(KernelParamsView params){
 ///////////
 
 void save_results(uint32_t hitCount, uint32_t maxHits, const Hit* h_hits_src, int si) {
-    // 4) hitCount is already passed as a value from host pinned memory
-    // No cudaMemcpy needed here!
-
     // Copy only as many hits as fit in the allocated buffer
     uint32_t nToCopy = std::min(hitCount, maxHits);
 
-    // 5) Access data directly from the host pinned pointer (h_hits_src)
-    // We create a local vector to sort without modifying the original pinned buffer
+    // Access data directly from the host pointer
     std::vector<Hit> sorted_hits(nToCopy);
     if (nToCopy > 0) {
         std::memcpy(sorted_hits.data(), h_hits_src, nToCopy * sizeof(Hit));
 
-        // sort alignments by length (Theme: Performance Analysis)
+        // Sort alignments by length for redability
         std::sort(sorted_hits.begin(), sorted_hits.end(),
                   [](const Hit& a, const Hit& b) {
                       if (a.bestScore != b.bestScore) return a.bestScore > b.bestScore;
@@ -555,7 +555,7 @@ void save_results(uint32_t hitCount, uint32_t maxHits, const Hit* h_hits_src, in
                   });
     }
 
-    // Save results to txt file (Theme: CUDA Program Structure [cite: 225])
+    // Save results to txt file
     namespace fs = std::filesystem;
     fs::create_directories("results");
 
@@ -587,23 +587,24 @@ void save_results(uint32_t hitCount, uint32_t maxHits, const Hit* h_hits_src, in
 ///////////
 
 int blast_main() {
-    // 1. Hardware Discovery (Do this once)
+    // Hardware Discovery to maximise utilization
     int deviceId;
     cudaGetDevice(&deviceId);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, deviceId);
 
-    // We launch 16 blocks per SM to ensure high occupancy and more blocks then SMs available to avoid idle standing SMs
+    // We launch 16 blocks per SM to ensure high occupancy and more blocks than SMs available to avoid idle standing SMs
     const int blocksPerSM = NUM_BLOCKS_PER_SM;
     dim3 blocksPerGrid(props.multiProcessorCount * blocksPerSM, 1);
     dim3 threadsPerBlock(NUM_THREADS_PER_BLOCK, 1);
 
-    // Add this after Hardware Discovery (Step 4)
+    // Debugging
     std::cout << "[GPU Config] Using Device: " << props.name << "\n";
     std::cout << "[GPU Config] MultiProcessors: " << props.multiProcessorCount << "\n";
     std::cout << "[GPU Config] Launching " << blocksPerGrid.x << " blocks of " << threadsPerBlock.x << " threads.\n";
 
-    // 2. Query Setup (Pinned Memory) to hide data transfer cost
+    // Allocating host and device memory
+    // We need to use pinned memory in order to use streams
     std::vector<char> query_seq = read_fasta("ncbi_data/query.fasta");
     uint32_t q_nChars = query_seq.size();
     uint32_t q_nBytes = (q_nChars + 3) / 4;
@@ -617,12 +618,12 @@ int blast_main() {
     CHECK_CUDA(cudaMemcpy(d_query, h_q_pinned, q_nBytes, cudaMemcpyHostToDevice));
     SeqView q_view { d_query, q_nBytes, q_nChars };
 
+    // Initialize lookup table
     LookupTable lTable = build_lookup_table_from_encoded(h_q_pinned, q_nChars, K);
     uint32_t *d_off, *d_pos;
     LookupTableView lView = lookup_table_to_device(lTable, &d_off, &d_pos);
 
-    // 3. PRE-PROCESSING: Encode all 10 sequences into Pinned Memory
-    // This avoids the synchronous bottlenecks
+    // Pre-compress all 10 sequences into pinned memory
     uint8_t* h_db_pinned_array[DB_SIZE];
     uint32_t db_nBytes_array[DB_SIZE];
     uint32_t db_nChars_array[DB_SIZE];
@@ -630,22 +631,22 @@ int blast_main() {
     for (int si = 1; si <= DB_SIZE; si++) {
         std::string path = "ncbi_data/sequence" + std::to_string(si) + ".fasta";
         std::vector<char> db_seq = read_fasta(path);
-        db_nChars_array[si-1] = db_seq.size();
-        db_nBytes_array[si-1] = (db_nChars_array[si-1] + 3) / 4;
+        db_nChars_array[si-1] = db_seq.size();  // length counter
+        db_nBytes_array[si-1] = (db_nChars_array[si-1] + 3) / 4;  // byte counter
 
         CHECK_CUDA(cudaMallocHost(&h_db_pinned_array[si-1], db_nBytes_array[si-1]));
         encoder(db_seq, db_nChars_array[si-1], h_db_pinned_array[si-1]);
     }
 
-    // 4. Concurrency Setup (Streams and Multi-Buffers)
-    const int nStreams = 4;
+    // Defining logic for our 3-way concurrency to hide memory transfer latency
+    const int nStreams = 3;
     cudaStream_t streams[nStreams];
     uint8_t* d_db_buffers[nStreams];
     Hit* d_hits_buffers[nStreams];
     uint32_t* d_hitCount_buffers[nStreams];
 
-    // Pinned result buffers (one set per sequence for final processing)
-    uint32_t MAX_HITS = 1u << 20;
+    // Result buffers of global memory
+    uint32_t MAX_HITS = 1u << 20;  // very large number should always be sufficient to store all hits
     uint32_t* h_hitCounts;
     Hit** h_all_hits;
     CHECK_CUDA(cudaMallocHost(&h_hitCounts, DB_SIZE * sizeof(uint32_t)));
@@ -661,13 +662,13 @@ int blast_main() {
         CHECK_CUDA(cudaMallocHost(&h_all_hits[si], MAX_HITS * sizeof(Hit)));
     }
 
-    // 5. DISPATCH LOOP: Pure Asynchronous Work [Lecture 4]
+    // Asynchronous Work where we overlap H2D, Kernel and D2D operations
     const uint32_t qBytesAligned = (q_view.nBytes + 3) & ~0x03;
     const uint32_t tileBytesMax = (TILE_CHARS + 3u) >> 2;
     size_t shmemBytes = (size_t)qBytesAligned + (size_t)tileBytesMax;
 
     for (int si = 1; si <= DB_SIZE; si++) {
-        int sIdx = (si - 1) % nStreams;
+        int sIdx = (si - 1) % nStreams; // assigning streams to DB sequences
         int arrIdx = si - 1;
 
         std::cout << "Sending Sequence " << si << " in stream" << sIdx << std::endl;
@@ -675,11 +676,11 @@ int blast_main() {
         SeqView db_view { d_db_buffers[sIdx], db_nBytes_array[arrIdx], db_nChars_array[arrIdx] };
         KernelParamsView params { q_view, db_view, lView, d_hits_buffers[sIdx], d_hitCount_buffers[sIdx], MAX_HITS };
 
-        // Ensure stream is ready from previous work
+        // Ensure that stream is ready from previous work
         cudaStreamSynchronize(streams[sIdx]);
         cudaMemsetAsync(d_hitCount_buffers[sIdx], 0, sizeof(uint32_t), streams[sIdx]);
 
-        // H2D -> KERNEL -> D2H Pipeline
+        // H2D -> Kernel -> D2H Pipeline
         cudaMemcpyAsync(d_db_buffers[sIdx], h_db_pinned_array[arrIdx], db_nBytes_array[arrIdx],
                         cudaMemcpyHostToDevice, streams[sIdx]);
 
@@ -691,18 +692,16 @@ int blast_main() {
                         cudaMemcpyDeviceToHost, streams[sIdx]);
     }
 
-    // 6. Final Synchronization and Processing
+    // Final synchronization and processing of results
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    std::cout << "\n--- Final Results ---\n";
+    std::cout << "\n Final Results\n";
     for (int si = 1; si <= DB_SIZE; si++) {
         save_results(h_hitCounts[si-1], MAX_HITS, h_all_hits[si-1], si);
-        std::cout << "Sequence " << si << ": Found " << h_hitCounts[si-1] << " hits. Results saved to results/ folder.\n";
+        std::cout << "Sequence " << si << ": Found " << h_hitCounts[si-1] << " hits. Results saved.\n";
     }
 
-
-
-    // 7. Cleanup (Code omitted for brevity, ensure all FreeHost and Free calls are included)
+    // Freeing all memory on device
     for (int i = 0; i < nStreams; i++) {
         cudaStreamDestroy(streams[i]);
         cudaFree(d_db_buffers[i]);
@@ -710,12 +709,14 @@ int blast_main() {
         cudaFree(d_hitCount_buffers[i]);
     }
 
+    // Freeing pinned memory
     for (int si = 0; si < DB_SIZE; si++) {
-        cudaFreeHost(h_db_pinned_array[si]); // Freeing pinned DB memory [cite: 212]
-        cudaFreeHost(h_all_hits[si]);        // Freeing pinned hits memory
+        cudaFreeHost(h_db_pinned_array[si]);
+        cudaFreeHost(h_all_hits[si]);
     }
 
-    cudaFreeHost(h_q_pinned);  // Freeing pinned query memory [cite: 212]
+    // Freeing host memory
+    cudaFreeHost(h_q_pinned);
     cudaFreeHost(h_hitCounts);
     cudaFree(d_query);
     cudaFree(d_off);

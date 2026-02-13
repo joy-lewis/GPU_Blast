@@ -26,27 +26,27 @@ struct LookupTableView { // lookup table with address pointers of device
 };
 
 struct SeqView {
-    const uint8_t* seq;   // device pointer to packed 2-bit DNA
-    uint32_t nBytes;      // bytes allocated for seq
-    uint32_t nChars;      // number of DNA bases
+    const uint8_t* seq;  // device pointer to packed 2-bit DNA
+    uint32_t nBytes;     // bytes allocated for seq
+    uint32_t nChars;     // number of DNA bases
 };
 
 
 struct Hit {
-    uint32_t db_pos;      // seed start in DB (char index)
-    uint32_t q_pos;       // seed start in query (char index)
-    int32_t  bestScore;   // best ungapped score after extension
-    int32_t  leftExt;     // how many bases extended to the left
-    int32_t  rightExt;    // how many bases extended to the right
+    uint32_t db_pos;    // seed start in DB (char index)
+    uint32_t q_pos;     // seed start in query (char index)
+    int32_t  bestScore; // best ungapped score after extension
+    int32_t  leftExt;   // how many bases extended to the left
+    int32_t  rightExt;  // how many bases extended to the right
 };
 
 struct KernelParamsView {
-    SeqView query; // query sequence
-    SeqView database; // database sequence
+    SeqView query;         // query sequence
+    SeqView database;      // database sequence
     LookupTableView lView;
     Hit*      hits;        // global output array
     uint32_t* hitCount;    // atomic counter in global memory
-    uint32_t  maxHits;      // capacity of hits[]
+    uint32_t  maxHits;     // capacity of hits
 };
 
 

@@ -47,9 +47,14 @@ in the code. Here is an overview of how the algorithm functions:
 
 //todo: insert pseudocode
 
-## Optimisation
+## Optimisation implemented within the extension function and the blast kernel
 
-//todo: aspects from poster + other attempts that failed
+### 1) Streams - current state
+Our algorithm is bounded by memory because we have very long sequences which need to be transfered from host to device. To hide the memory latency we implemented a 3-way concurrency where we overlap Host2Device, Kernel, Device2Host and afterwards performing some CPU work to save the alignment results to some output file.
+
+### Streams - what failed
+First we didn't use any streams and iterated over each database sequence one by one. This worked but also caused long idle times
+because due to the nature of the data, memory transfer are a bottleneck here.
 
 
 

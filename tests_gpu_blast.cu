@@ -60,9 +60,7 @@ int test_main() {
     }
     std::cout << "\n\n";
 
-    // -----------------------------
-    // NEW: Build and test lookup table
-    // -----------------------------
+    // build and test lookup table
     const uint32_t k = 2;
     const uint32_t N = (uint32_t)dna_length;
     const uint32_t L = N - k + 1u;
@@ -73,7 +71,7 @@ int test_main() {
     std::cout << "Lookup table test (k=" << k << ")\n";
     std::cout << "N=" << N << ", L=" << L << ", M=" << M << "\n";
 
-    // Print only keys that occur (for readability)
+    // Print only keys that occur
     for (uint32_t key = 0; key < M; ++key) {
         const uint32_t start = lut.offsets[key];
         const uint32_t end   = lut.offsets[key + 1u];
