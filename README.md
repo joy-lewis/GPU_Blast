@@ -1,8 +1,14 @@
 # GPU_Blast
 GPU accelerated BLAST algorithm for DNA-sequence alignment.
+### Build Option 1: How build via Makefile
+- Step 1: unzip the data file `ncbi_data.tar.gz`
+- Step 2: run `make`
+- Step 3: run `./gpu_blast`
+### Build Option 2: How to build via CLION
 
-### How to run on CLION
-The file `CMakeLists.txt` configures the run configuration. Here the only line that needs to be adjusted is line 4 (set(CMAKE_CUDA_COMPILER /home/....) where the user needs to put down the path to their nvcc version. Then in CLION Settings, configure CMakeApplication and select gpu_blast. Then the gpu_blast.cu can be run.
+- Step 1: unzip the data file `ncbi_data.tar.gz`
+- Step 2: The file `CMakeLists.txt` configures the run configuration. Here the only line that needs to be adjusted is line 4 (set(CMAKE_CUDA_COMPILER /home/....) where the user needs to put down the path to their nvcc version. 
+- Step 3: Then in CLION Settings, configure CMakeApplication and select gpu_blast. Then the gpu_blast.cu can be run.
 
 
 ### Algorithm Hyperparameters

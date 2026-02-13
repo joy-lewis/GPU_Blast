@@ -1,22 +1,24 @@
 # 1. Compiler Discovery
-# 'shell which nvcc' finds the compiler in the user's current PATH (e.g., Anaconda or System)
-# If not found, it defaults to the standard NVIDIA install path.
 NVCC := $(shell which nvcc 2>/dev/null)
 ifeq ($(NVCC),)
     NVCC := /usr/local/cuda/bin/nvcc
 endif
 
-# 2. Architecture Autodetect
-# This automatically finds the Compute Capability of the machine running the Makefile.
-# If no GPU is found, it defaults to a broad compatibility architecture (sm_70).
-ARCH := $(shell $(NVCC) --version >/dev/null 2>&1 && \
-         echo "-arch=native" || echo "-arch=sm_70")
+# 2. Universal Architecture (Fat Binary)
+# This targets common professional/academic GPUs:
+# sm_75: Turing (RTX 20-series, T4)
+# sm_80: Ampere (A100)
+# sm_86: Ampere (RTX 30-series)
+# sm_89: Ada (RTX 40-series, L40)
+# sm_90: Hopper/Blackwell (RTX 6000, H100) - includes PTX for forward compatibility
+GENCODE := -gencode arch=compute_75,code=sm_75 \
+           -gencode arch=compute_80,code=sm_80 \
+           -gencode arch=compute_86,code=sm_86 \
+           -gencode arch=compute_89,code=sm_89 \
+           -gencode arch=compute_90,code=compute_90
 
 # 3. Compilation Flags
-# -O3: Maximum optimization
-# -std=c++17: Language standard
-# -Xcompiler -Wall: Passes 'all warnings' to the underlying C++ compiler (gcc/clang)
-NVCC_FLAGS := -std=c++17 -O3 $(ARCH) -Xcompiler -Wall
+NVCC_FLAGS := -std=c++17 -O3 $(GENCODE) -Xcompiler -Wall
 
 # 4. Project Structure
 TARGET := gpu_blast
@@ -32,15 +34,9 @@ $(TARGET): $(SRCS) $(HEADERS)
 
 copy_data:
 	@mkdir -p results
-	@if [ -d "$(DATA_DIR)" ]; then \
-		echo "Found $(DATA_DIR), ensuring it exists in build folder..."; \
-		cp -r $(DATA_DIR) . 2>/dev/null || true; \
-	else \
-		echo "Warning: $(DATA_DIR) not found. Sequence files might be missing."; \
-	fi
+	@if [ -d "$(DATA_DIR)" ]; then cp -r $(DATA_DIR) . 2>/dev/null || true; fi
 
 clean:
 	rm -rf $(TARGET) results/
-	@echo "Cleanup complete."
 
 .PHONY: all clean copy_data
