@@ -102,13 +102,39 @@ Initialize local hit counter and buffer in shared memory
 
 ## Optimisations implemented within the extension function and the blast kernel
 
-### 1.1) Streams - Current state
-Our algorithm is bounded by memory because we have very long sequences which need to be transfered from host to device. To hide the memory latency we implemented a 3-way concurrency where we overlap Host2Device, Kernel, Device2Host and afterwards performing some CPU work to save the alignment results to some output file.
-
-### 1.2) Streams - What failed
+### 1.1) Streams - What failed
 First we didn't use any streams and iterated over each database sequence one by one. This worked but also caused long idle times
 because due to the nature of the data, memory transfer are a bottleneck here.
 
-### 2.1) 
+### 1.2) Streams - Current state
+Our algorithm is bounded by memory because we have very long sequences which need to be transferred from host to device. To hide the memory latency we implemented a 3-way concurrency where we overlap Host2Device, Kernel, Device2Host and after performing some CPU work to save the alignment results to some output file.
 
+### 2.1) Coalescing - What failed
+Because we compressed the bytes originally to an unint8_t array we had bad coalescing because threads in a warp would load only the 1 byte and leave a large gap of unused memory. That's why later when we load the 2-bit compressed sequences we do this using a word size of 4 byte to not leave any gaps.
 
+### 2.2) Coalescing - Current state
+By storing the sequence data in uint32_t arrays, each threads loads 4 bytes (16 DNA bases) from global into shared memory. This ensures that adjacent threads load adjacent memory blocks, without wasting any of the loaded memory.
+
+### 3.1) Shared Memory - What failed
+We put all the relevant data into shared memory from the start except for the local hit counter which we will discuss in section 6.1 (Privatization)
+
+### 3.2) Shared Memory - Current state
+Both the query sequence, the lookup table for the query and the database sequence tile for a block are moved to shared memory. All 3 objects are needed every time a thread performs and extension, so we have a high number of redundant memory accesses. Having them in shared memory reduces the latency of that.
+
+### 4.1) Occupancy - What failed
+Previously we also launched a fixed amount of blocks which performed very poorly in the occupancy metrics. Then we checked the lecture slides again and realised that we should hardcode a fixed block number but rather make it dependent on the hardware specs to maximize utilization.
+
+### 4.2) Occupancy - Current state
+To distribute work between blocks we partitioned the full DNA sequences into tiles of a fixed size and we distributed those tiles evenly among all blocks as follows: b_j processes X_(j+i*(N_b)) , ∀ i∈ {1,2,…,TileSize/N_t }. Because we have launched 8 blocks per SM, we have more blocks than SMs to hide memory latency if for example one block in a SM is busy with a data transfer others can start processing their assigned tiles.
+
+### 5.1) Warp Divergence - What failed
+We had the idea of a Thread-Stride logic from the start, but we still had pretty significant warp divergence because we had launched to threads per block comapred to the length of the tiles we hade for any given database sequence. 
+
+### 5.1) Warp Divergence - Current state
+A fundamental limitations of implementing the BLAST algorithm on GPU is warp divergence. It can happen that one thread gets a high scoring seed which makes the thread spend more time in the extension loop while another thread in the same warp might do no extensions. This warp divergence can’t be avoided fully due to the nature of the BLAST algorithm but we tried to reduce the likelihood from this happening by using the Thread-Stride logic described in the Parallel Algorithm section. Here we assign TileSize/N_t  > 1 many k-mer query seeds to each thread in a block. In our setup this number is 8, so that work is distributed more evenly.
+
+### 6.1) Privatization - What failed
+After finishing a successful extension, each thread in each block wrote that result to a buffer in global memory using atomic add, which increased the likelihood of stalling significantly, especially with our setup where we launched hundreds of blocks.
+
+### 6.1) Privatization - Current state
+Due to our tiling logic many blocks operate on the same sequence. To avoid atomic adds to global memory, we first let the threads increment a hit counter within the shared memory of their block, and once a tile is fully processed we then write that partial hit count to global memory. The tiling logic now helps us in avoiding atomic operations on global memory.
