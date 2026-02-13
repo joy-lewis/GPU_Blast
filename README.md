@@ -1,6 +1,10 @@
 # GPU_Blast
 GPU accelerated BLAST algorithm for DNA-sequence alignment.
 
+### How to run on CLION
+The file `CMakeLists.txt` configures the run configuration. Here the only line that needs to be adjusted is line 4 (set(CMAKE_CUDA_COMPILER /home/....) where the user needs to put down the path to their nvcc version. Then in CLION Settings, configure CMakeApplication and select gpu_blast. Then the gpu_blast.cu can be run.
+
+
 ### Algorithm Hyperparameters
 The algorithm hyperparameters are (there are more but we only describe the most important ones):
 ```ccp
