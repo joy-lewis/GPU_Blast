@@ -16,40 +16,33 @@
 #include <cuda_runtime.h>
 
 
-/////////////////////////////////////
-/////////// Define Hyperparameters //
-/////////////////////////////////////
-#define DB_SIZE 10 // number of sequences in Database
-#define K 12 // defines k-mer length // conditions: K>0
+///////////
+/////////// Define Algorithm Hyperparameters
+///////////
+
+#define DB_SIZE 10   // number of sequences in Database
+#define K 12   // defines k-mer length // conditions: K>0
+#define MAX_LOCAL_HITS 256   // maximum number of hits that fit into the local hit buffer within the shared memory of a block
+#define TILE_CHARS 1024u // length of a DB sequence tile in characters (DNA bases)
+
+#define MATCH_SCORE 1  // reward for finding a matching DNA base
+#define MISMATCH_PENALTY -1  // reward for finding a non-matching DNA base
+#define MIN_REPORT_SCORE K+1 // to only store the alignment results which are longer then the k-mer seed itself
+#define X_DROP 4 // X-drop termination condition to keep the extension finite
+
+
+///////////
+/////////// Define Launch Configuration Parameters
+///////////
 
 #define NUM_THREADS_PER_BLOCK 128
 #define NUM_BLOCKS_PER_SM 8
-#define MAX_LOCAL_HITS 256 // maximum number of hits that fit into the local hit buffer within the shared memory of a block
-
-// Tile length in "characters" (DNA bases), cant be larger then (total-shared-memory-query-memory*NUM_BLOCKS) / NUM_BLOCKS
-// Example: 1024 chars => 256 bytes.
-// we would want to have significantly more tiles then total blocks in order to make the for loop (where a single block processes multiple tiles)
-// has a benefit
-
-// because if i launch 16 blocks per SM then the first 16 blocks will process the first 16 tiles
-// all on SM-0 then the blocks 17 to 32 process tiles 17 through 32 and the only way of block 0 not to repeat work
-// that has already been done by another block it has to jump over all blocks that we have launche
-#define TILE_CHARS 1024u //todo:optimizable
-
-// Scoring function for matches during extension. +1 for match, -1 for non-match
-#define MATCH_SCORE 1
-#define MISMATCH_PENALTY -1
-
-// Minimal score to report
-#define MIN_REPORT_SCORE K+1 // this way we only record matches where the alignment is larger then the seed k-mer
-
-// X-drop termination condition to keep the extension finite
-#define X_DROP 4
 
 
-////////////////////////////
-/////////// Sanity checks //
-////////////////////////////
+///////////
+/////////// Sanity checks
+///////////
+
 #define CHECK_CUDA(call)                                            \
     {                                                               \
         cudaError_t err = (call);                                   \
@@ -62,15 +55,10 @@
     }
 
 
-//TODO:VERY IMPORTANT!!
-//use the length of the original sequence, to know when to stop processing the
-//encoded binary sequence, because the last few bits are all zero padded.
-//Same goes for when we decode the final alignment. We need to pass along the length of valid bit pairs (i.e. characters)
-//so we dont decode all bits in the last byte of the uint8_t array.
+///////////
+/////////// Extract DNA sequences from fasta files
+///////////
 
-/////////////////////////////////////////////
-/////// Extract DNA sequence from fasta file
-/////////////////////////////////////////////
 std::vector<char> read_fasta(const std::string& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("Failed to open: " + path);
